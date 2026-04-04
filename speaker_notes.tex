@@ -76,11 +76,17 @@
 \say{Simple scan for separator targets. Everything before sep is forward, after sep\_backward is backward. The first \_foreach operation after backward marks the optimizer region.}
 
 \slide{Static Analysis: Parameter Identification}
-\say{This was one of the trickiest challenges. The starter code uses \texttt{foreach=True} for Adam, which decomposes into hundreds of small ops --- no single optimizer node. And FakeTensors all have \texttt{requires\_grad=False}.}
+\say{This was one of the trickiest challenges. All three types of placeholder --- parameters, optimizer states, and batch data --- look identical in the graph. They're all \texttt{placeholder} nodes, and FakeTensors all have \texttt{requires\_grad=False}, so we can't use that flag. And with \texttt{foreach=True} Adam, the optimizer is decomposed into hundreds of small \texttt{\_foreach\_*} ops --- there's no single \texttt{\_fused\_adam} node whose arguments list the parameters.}
 
-\say{Our solution: parameters are the only placeholders that appear in \emph{both} the forward pass and the optimizer step. Batch data appears in forward and backward but NOT optimizer. Optimizer states appear only in optimizer. This works reliably for all models.}
+\say{The insight is to look at \emph{where} each placeholder is used across the graph regions. From the debug output: a weight matrix like \texttt{arg0\_1} has users in the forward pass (\texttt{t} at step 19) \emph{and} in the optimizer (\texttt{\_foreach\_addcdiv} at step 171). The batch tensor \texttt{arg3\_3} has users in forward (\texttt{addmm}) and backward (\texttt{mm\_2}), but \emph{not} the optimizer --- it's never updated. An optimizer state like \texttt{arg2\_1} has users \emph{only} in the optimizer region.}
 
-\qa{What if a model uses SGD instead of Adam?}{The usage-pattern heuristic still works --- parameters are always updated by the optimizer (forward + optimizer users). The specific optimizer decomposition doesn't matter.}
+\say{So the rule is: parameters are the only placeholders that appear in both forward and optimizer. Two lines of code: check for a forward user and an optimizer user. This works for every model --- DummyModel, ResNet18, ResNet50, BERT --- regardless of optimizer type.}
+
+\qa{What if a model uses SGD instead of Adam?}{The usage-pattern heuristic still works --- parameters are always consumed in forward (to compute outputs) and updated in the optimizer step (gradient descent). The specific decomposition doesn't matter.}
+
+\qa{What about shared parameters (e.g., tied embeddings in a transformer)?}{Shared parameters would still satisfy both conditions --- they'd have forward users (wherever they're used) and optimizer users (the update step). They'd appear once as a placeholder and be correctly identified.}
+
+\qa{Why not just check which placeholders have \texttt{requires\_grad=True}?}{We tried that first. It doesn't work because \texttt{make\_fx} traces with \texttt{FakeTensorMode}, which creates fake tensors that all have \texttt{requires\_grad=False} regardless of the original tensor's setting. The gradient flag isn't propagated through symbolic tracing.}
 
 \slide{Five Tensor Categories}
 \say{Five categories matching the course spec: PARAM, ACT, GRAD, OPTIMIZER\_STATE, OTHER. Gradients are only identifiable with fused Adam. Optimizer states are placeholders with optimizer-only users.}
