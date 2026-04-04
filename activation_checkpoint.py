@@ -185,6 +185,15 @@ def select_activations_to_recompute(
     evicted: Set[fx.Node] = set()
     eviction_order: List[fx.Node] = []
     remaining = set(profiler.intermediate_nodes)
+    prev_peak = baseline_peak
+
+    # Quick check: would evicting ALL intermediates reduce peak at all?
+    # If peak is in the optimizer/backward region where no activations are
+    # live, AC cannot help.  Avoid pointlessly evicting everything.
+    all_evicted_peak = _simulate_peak_memory(profiler, set(profiler.intermediate_nodes))
+    if all_evicted_peak >= baseline_peak:
+        # AC cannot reduce peak — it's dominated by non-activation memory.
+        return [], list(profiler.intermediate_nodes)
 
     # Greedy loop (Algorithm B): each iteration evicts the best candidate.
     while remaining:
@@ -192,6 +201,14 @@ def select_activations_to_recompute(
         current_peak = _simulate_peak_memory(profiler, evicted)
         if current_peak <= mem_limit:
             break
+
+        # Early termination: if the last eviction didn't reduce peak at all,
+        # the peak is dominated by non-activation memory (e.g. backward
+        # intermediates, optimizer state).  Further evictions are pointless.
+        if eviction_order and current_peak >= prev_peak:
+            break
+
+        prev_peak = current_peak
 
         # Pick candidate with highest recompute_ratio.
         best_node = None
