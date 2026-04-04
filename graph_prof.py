@@ -207,28 +207,23 @@ class GraphProfiler(fx.Interpreter):
         # ------------------------------------------------------------------
         # 2. Locate the optimizer node and extract parameter / gradient sets.
         #
-        # The _fused_adam node's arguments are:
+        # Strategy A (fused=True): The _fused_adam node's arguments are:
         #   args[0] = list of parameter nodes
         #   args[1] = list of gradient nodes
-        #   args[2] = list of exp_avg nodes
-        #   args[3] = list of exp_avg_sq nodes
-        #   ...
+        #
+        # Strategy B (foreach=True): No single optimizer node exists.  The
+        # optimizer step is decomposed into many _foreach_* ops.  We identify
+        # parameters by checking which placeholder nodes have requires_grad
+        # set in their FakeTensor metadata.
         # ------------------------------------------------------------------
 
         self.optimizer_node: Optional[fx.Node] = None
         self.optimizer_index: int = -1
 
-        # Search for known optimizer node targets.  _fused_adam is used when
-        # Adam(fused=True); _foreach_add_.List is the first foreach op when
-        # Adam(foreach=True) decomposes through SPMD_DECOMP_TABLE.
-        _OPTIMIZER_TARGETS = {
-            torch.ops.aten._fused_adam.default,
-        }
-
         for i, node in enumerate(self.node_list):
             if (
                 node.op == OP.CALL_FUNCTION
-                and node.target in _OPTIMIZER_TARGETS
+                and node.target == torch.ops.aten._fused_adam.default
             ):
                 self.optimizer_node = node
                 self.optimizer_index = i
@@ -238,8 +233,50 @@ class GraphProfiler(fx.Interpreter):
         self.grad_nodes: Set[fx.Node] = set()
 
         if self.optimizer_node is not None:
+            # Strategy A: read directly from _fused_adam args.
             self.param_nodes = set(self.optimizer_node.args[0])
             self.grad_nodes = set(self.optimizer_node.args[1])
+        else:
+            # Strategy B: identify params from FakeTensor metadata.
+            # Parameters are placeholder nodes whose traced FakeTensor has
+            # requires_grad=True.  Optimizer states and batch data do not.
+            for node in self.node_list:
+                if node.op != OP.PLACEHOLDER:
+                    continue
+                val = node.meta.get("val", None)
+                if val is None:
+                    continue
+                if isinstance(val, torch.Tensor) and val.requires_grad:
+                    self.param_nodes.add(node)
+
+            # Identify the optimizer region boundary: the first copy_ node
+            # after the backward pass that targets a parameter is the start
+            # of the optimizer step.
+            for i, node in enumerate(self.node_list):
+                if i <= self.sep_bwd_index:
+                    continue
+                if (
+                    node.op == OP.CALL_FUNCTION
+                    and hasattr(node.target, "__name__")
+                    and "copy_" in str(node.target)
+                    and any(inp in self.param_nodes for inp in node.all_input_nodes)
+                ):
+                    self.optimizer_index = i
+                    break
+
+            # If we still didn't find the optimizer boundary, fall back to
+            # placing it after all backward nodes.  We detect the first
+            # _foreach_* op after sep_backward as the optimizer start.
+            if self.optimizer_index < 0:
+                for i, node in enumerate(self.node_list):
+                    if i <= self.sep_bwd_index:
+                        continue
+                    if (
+                        node.op == OP.CALL_FUNCTION
+                        and "_foreach" in str(node.target)
+                    ):
+                        self.optimizer_index = i
+                        break
 
         # ------------------------------------------------------------------
         # 3. Classify every node's region.
@@ -247,7 +284,7 @@ class GraphProfiler(fx.Interpreter):
 
         self.node_region: Dict[fx.Node, Region] = {}
         for i, node in enumerate(self.node_list):
-            if self.optimizer_node is not None and i >= self.optimizer_index:
+            if self.optimizer_index >= 0 and i >= self.optimizer_index:
                 self.node_region[node] = Region.OPTIMIZER
             elif i >= self.sep_bwd_index:
                 self.node_region[node] = Region.BACKWARD

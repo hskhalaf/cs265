@@ -145,7 +145,7 @@ def experiment():
     optim = torch.optim.Adam(
         model.parameters(),
         lr=0.01,
-        fused=True,
+        foreach=True,
         capturable=True,
     )
 
