@@ -89,7 +89,19 @@
 \qa{Why not just check which placeholders have \texttt{requires\_grad=True}?}{We tried that first. It doesn't work because \texttt{make\_fx} traces with \texttt{FakeTensorMode}, which creates fake tensors that all have \texttt{requires\_grad=False} regardless of the original tensor's setting. The gradient flag isn't propagated through symbolic tracing.}
 
 \slide{Five Tensor Categories}
-\say{Five categories matching the course spec: PARAM, ACT, GRAD, OPTIMIZER\_STATE, OTHER. Gradients are only identifiable with fused Adam. Optimizer states are placeholders with optimizer-only users.}
+\say{The course spec requires five categories. Let me walk through each.}
+
+\say{PARAM --- we just discussed this. Placeholder nodes with users in both the forward and optimizer regions. The model weights and biases.}
+
+\say{ACT --- the intermediate activations that AC targets. These are \texttt{call\_function} nodes produced during the forward pass that have at least one user in the backward pass. For example, \texttt{relu} at step 85 is consumed by \texttt{threshold\_backward} at step 119. The ``forward producer, backward consumer'' pattern is what defines an activation --- it's a tensor sitting idle in memory waiting for backward.}
+
+\say{GRAD --- gradient tensors. We can only identify these when \texttt{fused=True} Adam is used, because the \texttt{\_fused\_adam} node has structured arguments: \texttt{args[0]} = parameters, \texttt{args[1]} = gradients. With \texttt{foreach=True}, gradients are mixed into the decomposed \texttt{\_foreach\_*} ops and we can't distinguish them. That's why the output shows GRAD count = 0 --- they get lumped into OTHER. This doesn't affect AC decisions since we only need PARAM and ACT for that.}
+
+\say{OPTIMIZER\_STATE --- Adam's \texttt{exp\_avg}, \texttt{exp\_avg\_sq}, and \texttt{step} counters. Placeholder nodes whose users are \emph{exclusively} in the optimizer region. Unlike parameters which are also used in forward, optimizer states are only touched during the Adam update.}
+
+\say{OTHER --- everything else: batch data (forward + backward users but not optimizer), the loss tensor, backward computation nodes like \texttt{threshold\_backward} and \texttt{mm}, and all the optimizer computation nodes like \texttt{\_foreach\_add} and \texttt{copy\_}.}
+
+\qa{Does it matter that GRAD count is 0?}{Not for our purposes. The AC algorithm only needs to know which nodes are activations (to consider evicting) and which are parameters (to know they're always available for recomputation). Gradient classification is informational for the memory breakdown chart but doesn't affect decisions.}
 
 \slide{Intermediate Activations and Lifetimes}
 \say{Four conditions define an intermediate activation. For each one, we compute the idle period: the gap between last forward use and first backward use. Longer idle period + larger size = better checkpointing candidate.}
