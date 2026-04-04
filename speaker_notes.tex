@@ -109,7 +109,17 @@
 \qa{Are all forward-pass tensors intermediates?}{No. Only those with backward users. A tensor used only in forward (e.g., the output of a pooling layer that feeds the loss but not backward directly) wouldn't qualify. In practice most forward computation nodes do feed into backward.}
 
 \slide{Runtime Profiling}
-\say{CUDA events for timing, memory\_allocated for deltas. We also swap intermediates to CPU during profiling --- this measures swap latency and prevents OOM on large models. The swap happens outside the node timing measurement.}
+\say{The static analysis reads the graph structure. Runtime profiling actually \emph{executes} it. The FX Interpreter calls \texttt{run\_node()} for every node --- we override it to measure two things.}
+
+\say{First, timing. We record a CUDA event before and after the node executes. \texttt{torch.cuda.synchronize()} is critical here --- GPU operations are asynchronous, meaning Python returns immediately while the GPU kernel is still running. Without sync, we'd measure Python dispatch time, not actual GPU kernel time. \texttt{elapsed\_time} between the two events gives us the real wall-clock GPU time.}
+
+\say{Second, memory. We read \texttt{torch.cuda.memory\_allocated()} before and after. The delta tells us how much GPU memory the operation allocated or freed. For example, \texttt{addmm} (a Linear forward) allocates a new output tensor (+400 KB), while some backward ops free tensors they no longer need.}
+
+\say{The activation swapping is the clever part. After the static analysis identifies each intermediate's last forward use and first backward use, we build a swap schedule. When we execute the node at \texttt{last\_fwd\_access} for intermediate X, we move X to CPU with \texttt{.cpu()} right after. When we reach \texttt{first\_bwd\_access}, we move it back with \texttt{.cuda()} right before. This does two things: it measures actual PCIe swap latency per tensor, and it prevents OOM --- without swapping, profiling ResNet50 or BERT would keep all intermediates in GPU memory simultaneously. The swap happens \emph{outside} the \texttt{super().run\_node()} call, so it doesn't contaminate the per-node timing.}
+
+\qa{Doesn't synchronizing after every node slow down profiling?}{Yes, significantly. Synchronization forces the GPU to finish all pending work before Python continues. In normal training, operations overlap and pipeline. During profiling we sacrifice throughput for measurement accuracy. That's why we only profile for a few iterations (3 measurement runs), not the entire training.}
+
+\qa{Why swap to CPU instead of just deleting the tensor?}{We need the tensor back for the backward pass --- the interpreter environment (\texttt{self.env}) must have it when a backward node tries to consume it. Swapping preserves the data while freeing GPU memory. Deleting would cause a crash when backward tries to access it.}
 
 \slide{Memory Breakdown Visualization}
 \say{The stacked bar chart. Green is activations --- they accumulate during forward, get freed during backward. The peak tells you where to focus. If green dominates, AC helps. If red (optimizer state) dominates, you need a different strategy.}
