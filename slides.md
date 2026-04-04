@@ -276,7 +276,7 @@ Green accumulates in forward and freed in backward. We should apply AC at the pe
 |-------|---:|---------:|----------:|---------:|------:|
 | DummyModel | 19 | 4 MB | 6.5 MB | 14.5 MB | 0.45 |
 | ResNet18 (bs=16) | 103 | 331 MB | 506 MB | 523 MB | **0.97** |
-| ResNet50 (bs=16) | 268 | 1310 MB | 1643 MB | --- | --- |
+| ResNet50 (bs=16) | 268 | 1310 MB | 1643 MB | 1671.13 | **0.98** |
 | BERT-base (bs=4) | 363 | 716 MB | 2506 MB | 2118 MB | 1.18 |
 
 \vspace{0.3em}
@@ -361,23 +361,22 @@ Estimates peak given evicted set:
 
 ## Cascading Recomputation (Alg. E/F)
 
-If we evict A, and B needs A to be recomputed:
+If we evict tensor A, and B depends on A as a recomputation source:
 
-\begin{center}
-\begin{tikzpicture}[every node/.style={font=\small},
-  box/.style={draw, rounded corners, minimum width=2.2cm, minimum height=0.7cm}]
-  \node[box, fill=red!15] (a) at (0,0) {A (evicted)};
-  \node[box, fill=green!15] (b) at (5.5,0) {B};
-  \draw[->, thick] (a) -- (b) node[midway, above, font=\footnotesize] {recomp\_src};
-  \node[anchor=north west, font=\footnotesize, text width=7cm] at (0,-0.8)
-    {$\Rightarrow$ B.recomp\_cnt += A.recomp\_cnt \quad
-     $\Rightarrow$ B.total\_time = B.time $\times$ B.cnt \quad
-     $\Rightarrow$ B.ratio $\downarrow$ (less attractive to evict)};
-\end{tikzpicture}
-\end{center}
+- To recompute B in backward, we must **first recompute A**
+- B's cost increases: `total_time = recomp_time * recomp_cnt`
 
-- Evicting A makes recomputing B more expensive (must recompute A first)
-- B's ratio drops $\Rightarrow$ algorithm avoids cascading chains
+**Example:**
+
+| | Before evicting A | After evicting A |
+|---|---|---|
+| B.recomp\_cnt | 1 | **2** (must also recompute A) |
+| B.total\_time | 0.06 ms | **0.12 ms** |
+| B.ratio | 200M | **100M** (half as attractive) |
+
+$\Rightarrow$ B is now **less likely** to be evicted next
+
+$\Rightarrow$ Prevents cascading chains of expensive recomputations
 
 ## Early Termination: The BERT Finding
 
