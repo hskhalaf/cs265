@@ -147,7 +147,13 @@
 \say{The simulator walks the timeline. Retained tensors are live from production to last use. Evicted tensors are live during forward, FREE during idle, briefly live at recomputation. Peak is the max over all steps. This is why ``memory freed'' exceeds ``peak reduction'' --- evicted tensors are still live in forward.}
 
 \slide{Cascading Recomputation}
-\say{When A is evicted and B depends on A, recomputing B now requires first recomputing A. B's cost goes up, ratio goes down. This prevents runaway chains. From Algorithms E and F in the paper.}
+\say{A key concept here is \texttt{total\_recomp\_time}. This is the total wall-clock cost of recomputing a tensor across its entire lifetime, accounting for cascading dependencies. The formula is simple: \texttt{total\_recomp\_time = recomp\_time * recomp\_cnt}. \texttt{recomp\_time} is the profiled execution time of the single node --- for example, relu takes 0.06 ms. \texttt{recomp\_cnt} is how many times you'd need to recompute it, starting at 1. So initially, total equals recomp\_time for every intermediate.}
+
+\say{Where it gets interesting: cascading. Say tensor B depends on tensor A --- A is an input to B's computation. If A gets evicted, then to recompute B during backward, you first need to recompute A. So B's effective cost goes up. Before evicting A, B has recomp\_cnt = 1 and total = 0.06 ms. After evicting A, B's recomp\_cnt becomes 2 and total becomes 0.12 ms. B's recompute\_ratio --- memory\_size divided by total\_recomp\_time --- drops by half, making B less attractive to evict next.}
+
+\say{This prevents the algorithm from creating a chain where evicting B would require first recomputing A then B --- compounding costs. The distinction: \texttt{recomp\_time} is the cost of just this one node. \texttt{total\_recomp\_time} is the cost including all the dependencies you'd need to recompute first.}
+
+\qa{Does this mean evicting a widely-used tensor is penalised?}{Yes. If tensor A is a recomp\_src for many other tensors, evicting A increases all of their costs simultaneously. Their ratios all drop, making the algorithm naturally cautious about evicting ``hub'' tensors that many others depend on.}
 
 \slide{Early Termination: The BERT Finding}
 \say{BERT's peak is at the optimizer step. No activations alive there. Our quick check detects this and returns immediately. The lesson: not every model benefits from AC. BERT's bottleneck is the optimizer, not activations.}
