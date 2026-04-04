@@ -15,9 +15,9 @@ Architecture
 The profiler performs two kinds of analysis:
 
 1. **Static analysis** (in __init__): walks the graph once to identify forward/
-   backward boundaries, classify nodes by type (PARAM, ACT, GRAD, OTHER),
-   identify intermediate activations, and compute their lifetimes (last forward
-   use, first backward use).
+   backward boundaries, classify nodes into five types (PARAM, ACT, GRAD,
+   OPTIMIZER_STATE, OTHER), identify intermediate activations, and compute
+   their lifetimes (last forward use, first backward use).
 
 2. **Runtime profiling** (in run_node): executes each node while measuring
    wall-clock time via torch.cuda.Event and GPU memory delta via

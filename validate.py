@@ -17,6 +17,7 @@ from typing import Any, List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.fx as fx
 
 from graph_tracer import SEPFunction, compile as gt_compile
@@ -65,7 +66,7 @@ def _setup_model(name: str):
 
     elif name == "Resnet18":
         from torchvision.models import resnet18
-        import torch.nn.functional as F
+
         with torch.device(dev):
             model = resnet18()
         inp = torch.randn(16, 3, 224, 224, device=dev)
@@ -85,7 +86,7 @@ def _setup_model(name: str):
 
     elif name == "Bert":
         from transformers import BertConfig, BertForSequenceClassification
-        import torch.nn.functional as F
+
 
         num_classes = 2
         seq_len = 128

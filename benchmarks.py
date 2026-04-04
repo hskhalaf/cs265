@@ -46,7 +46,11 @@ model_batch_sizes: Dict[str, int] = {
 
 
 class Experiment:
-    def __init__(self, model_name: str, batch_size: int, extra_args=[]):
+    """Benchmark harness for a single model.  Handles model creation, optimizer
+    setup, training step definition, and the graph transformation callback that
+    runs the profiler and AC selection."""
+
+    def __init__(self, model_name: str, batch_size: int):
         assert model_name in model_names, (
             f"Model {model_name} not found in {model_names}"
         )
@@ -169,7 +173,8 @@ class Experiment:
             logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1,
         )
 
-    def init_opt_states(self):
+    def init_opt_states(self) -> None:
+        """Run one dummy optimizer step to initialise Adam's lazy state."""
         for param in self.model.parameters():
             if param.requires_grad:
                 param.grad = torch.rand_like(param)
@@ -210,7 +215,8 @@ class Experiment:
 
         return gm
 
-    def run(self):
+    def run(self) -> None:
+        """Initialise optimizer state, compile, and run the full pipeline."""
         self.init_opt_states()
         compiled_fn = compile(self.train_step, self.graph_transformation)
         compiled_fn(self.model, self.optimizer, self.example_inputs)
