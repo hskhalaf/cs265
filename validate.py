@@ -84,9 +84,28 @@ def _setup_model(name: str):
 
         return model, opt, example_inputs, train_step
 
+    elif name == "Resnet50":
+        from torchvision.models import resnet50
+
+        with torch.device(dev):
+            model = resnet50()
+        inp = torch.randn(16, 3, 224, 224, device=dev)
+        target = torch.randint(0, 10, (16,), device=dev)
+        opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
+        example_inputs = (inp, target)
+
+        def train_step(model, optim, example_inputs):
+            logits = model(example_inputs[0])
+            loss = F.cross_entropy(logits, example_inputs[1])
+            loss = SEPFunction.apply(loss)
+            loss.backward()
+            optim.step()
+            optim.zero_grad()
+
+        return model, opt, example_inputs, train_step
+
     elif name == "Bert":
         from transformers import BertConfig, BertForSequenceClassification
-
 
         num_classes = 2
         seq_len = 128
@@ -259,11 +278,11 @@ def check_2_ac_decision_sanity(profiler: GraphProfiler, name: str):
         status_d = "PASS" if relu_recomputed > 0 else "WARN"
         print(f"  [{status_d}] DummyModel: {relu_recomputed} relu ops recomputed "
               f"(expected: cheap ops evicted first)")
-    elif name == "Resnet18":
+    elif name in ("Resnet18", "Resnet50"):
         retain_names = {n.name for n in to_retain}
         conv_retained = sum(1 for n in retain_names if "convolution" in n)
         status_d = "PASS" if conv_retained > 0 else "WARN"
-        print(f"  [{status_d}] ResNet18: {conv_retained} convolution ops retained "
+        print(f"  [{status_d}] {name}: {conv_retained} convolution ops retained "
               f"(expected: expensive ops kept)")
     elif name == "Bert":
         # BERT's peak is in the optimizer region — AC cannot help.
@@ -399,7 +418,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1:
         if sys.argv[1] == "--all":
-            models = ["DummyModel", "Resnet18", "Bert"]
+            models = ["DummyModel", "Resnet18", "Resnet50", "Bert"]
         else:
             models = [sys.argv[1]]
 
