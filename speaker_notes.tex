@@ -1,0 +1,160 @@
+% Speaker Notes for CS265 Midterm Presentation
+% Compile: xelatex slides.tex
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\definecolor{question}{RGB}{0,100,180}
+\definecolor{note}{RGB}{100,100,100}
+\newcommand{\slide}[1]{\subsection*{Slide: #1}}
+\newcommand{\say}[1]{\textbf{Say:} #1}
+\newcommand{\qa}[2]{\textcolor{question}{\textbf{Q:} #1} \\ \textbf{A:} #2}
+\newcommand{\timing}[1]{\hfill\textcolor{note}{\textit{(#1)}}}
+
+\title{Speaker Notes\\{\large CS265 Activation Checkpointing --- Midterm Presentation}}
+\author{Hadi Khalaf}
+\date{}
+
+\begin{document}
+\maketitle
+
+\textbf{Total time:} 25--30 minutes. Pace: $\sim$1 minute per slide. The results slides and key findings can be expanded if time permits.
+
+\tableofcontents
+
+\section{Motivation (Slides 1--6)} \timing{$\sim$6 min}
+
+\slide{Title Slide}
+\say{This project implements activation checkpointing for PyTorch --- a technique that reduces GPU memory by trading off extra computation. I'll walk through what we built and what we found.}
+
+\slide{Outline}
+\say{Three sections: motivation, Phase 1 (the profiler), and Phase 2 (the selection algorithm). I'll finish with results and next steps.}
+
+\slide{The Memory Problem in DNN Training}
+\say{When you train a neural network, the GPU has to hold four things simultaneously: the model parameters (weights), the activations (intermediate outputs from each layer), the gradients, and the optimizer state like Adam's moment buffers. The key point is that activations typically account for 70--85\% of peak memory. And the problem is getting worse --- model sizes grow exponentially but GPU memory grows linearly.}
+
+\qa{Why 70--85\%? Where does that number come from?}{It's empirical --- from analyzing memory breakdowns of standard models like ResNet, BERT, GPT. Parameters and optimizer state are proportional to model size, but activations are proportional to model size \emph{times} batch size \emph{times} sequence length. For large batches, activations dominate.}
+
+\qa{What about techniques like mixed precision or gradient accumulation?}{Those help too, but they're orthogonal. Mixed precision halves the bytes per element; AC reduces the number of elements stored simultaneously. They compose well --- you can use both.}
+
+\slide{Why Activations Dominate Peak Memory}
+\say{Here's the key insight. The forward pass produces activations Z1 through Z4, left to right. But the backward pass needs them in \emph{reverse} order. So Z1 is produced first but needed last --- it sits in memory the longest. At the peak (typically the end of the forward pass), ALL activations are alive simultaneously. That's why they dominate.}
+
+\qa{Can't you just free each activation as soon as the next layer is done with it?}{No --- the backward pass needs them later. For example, to compute the gradient of a linear layer, you need its forward input. PyTorch keeps these alive in autograd closures. They can't be freed until the corresponding backward hook fires.}
+
+\slide{Activation Checkpointing: The Idea}
+\say{The idea is simple: don't keep all activations in memory. Discard some after the forward pass, and recompute them during backward when needed. This trades compute for memory. The question is: which ones to discard? You want to discard the ones that are cheap to recompute (like ReLU) and keep the expensive ones (like convolutions). That's what Phase 2 decides.}
+
+\qa{Isn't recomputation wasteful? You're doing the same work twice.}{Yes, it's extra compute. But on modern GPUs, the forward pass is fast --- typically a few milliseconds per operation. The memory savings (hundreds of MBs) can let you increase batch size, which improves training throughput more than the recomputation costs.}
+
+\slide{Project Overview}
+\say{The project has three phases. Phase 1 builds the profiler that collects the data. Phase 2 implements the mu-TWO algorithm that makes the selection decisions. Phase 3, which is next, will actually rewrite the graph to insert recomputation nodes. I've completed Phases 1 and 2, tested on four models.}
+
+
+\section{Phase 1: Graph Profiler (Slides 7--17)} \timing{$\sim$10 min}
+
+\slide{Background: Why FX Tracing?}
+\say{My first milestone used PyTorch module hooks to instrument the model from the outside. That worked for profiling, but hooks can't rewrite the graph. For Phase 3, we need to insert new operations into the computation. PyTorch's FX framework gives us a single, symbolic graph that contains the entire training step --- forward, backward, and optimizer --- and it's rewritable. So we switched to FX.}
+
+\qa{What's the difference between FX tracing and torch.compile?}{torch.compile uses Dynamo for tracing, which handles more Python constructs. FX's \texttt{make\_fx} is simpler --- it uses fake tensors to trace through the ops symbolically. The course starter code uses \texttt{make\_fx}, so that's what we build on.}
+
+\slide{The Traced Graph Structure}
+\say{The traced graph has a clear structure. At the top, placeholder nodes represent inputs: parameters, optimizer states, and batch data. Then forward operations, a separator node we insert to mark the boundary, loss computation, another separator for the backward boundary, backward operations, and finally the optimizer step. This structure lets us partition everything into four regions.}
+
+\qa{What are the separator nodes?}{SEPFunction is an identity function we wrap around the loss. It generates explicit marker nodes in the graph --- a clean boundary that's guaranteed to be there regardless of the loss function used.}
+
+\slide{Phase 1 Architecture}
+\say{The profiler has three components. Static analysis happens once when created --- walks the graph for boundaries, tensor types, and lifetimes. Runtime profiling measures timing and memory per node during actual execution. The visualizer produces the stacked bar chart.}
+
+\slide{Static Analysis: Boundary Detection}
+\say{Simple scan for separator targets. Everything before sep is forward, after sep\_backward is backward. The first \_foreach operation after backward marks the optimizer region.}
+
+\slide{Static Analysis: Parameter Identification}
+\say{This was one of the trickiest challenges. The starter code uses \texttt{foreach=True} for Adam, which decomposes into hundreds of small ops --- no single optimizer node. And FakeTensors all have \texttt{requires\_grad=False}.}
+
+\say{Our solution: parameters are the only placeholders that appear in \emph{both} the forward pass and the optimizer step. Batch data appears in forward and backward but NOT optimizer. Optimizer states appear only in optimizer. This works reliably for all models.}
+
+\qa{What if a model uses SGD instead of Adam?}{The usage-pattern heuristic still works --- parameters are always updated by the optimizer (forward + optimizer users). The specific optimizer decomposition doesn't matter.}
+
+\slide{Five Tensor Categories}
+\say{Five categories matching the course spec: PARAM, ACT, GRAD, OPTIMIZER\_STATE, OTHER. Gradients are only identifiable with fused Adam. Optimizer states are placeholders with optimizer-only users.}
+
+\slide{Intermediate Activations and Lifetimes}
+\say{Four conditions define an intermediate activation. For each one, we compute the idle period: the gap between last forward use and first backward use. Longer idle period + larger size = better checkpointing candidate.}
+
+\qa{Are all forward-pass tensors intermediates?}{No. Only those with backward users. A tensor used only in forward (e.g., the output of a pooling layer that feeds the loss but not backward directly) wouldn't qualify. In practice most forward computation nodes do feed into backward.}
+
+\slide{Runtime Profiling}
+\say{CUDA events for timing, memory\_allocated for deltas. We also swap intermediates to CPU during profiling --- this measures swap latency and prevents OOM on large models. The swap happens outside the node timing measurement.}
+
+\slide{Memory Breakdown Visualization}
+\say{The stacked bar chart. Green is activations --- they accumulate during forward, get freed during backward. The peak tells you where to focus. If green dominates, AC helps. If red (optimizer state) dominates, you need a different strategy.}
+
+\slide{Phase 1 Results: Profiler Accuracy}
+\say{Validated against actual GPU measurements. ResNet18 is 0.97x --- near-perfect. DummyModel is 0.45x because CUDA allocator rounding is proportionally large on small tensors. BERT is 1.18x because we overcount optimizer temporaries. All within reasonable bounds.}
+
+\qa{Why does the static estimate differ from actual GPU?}{Our estimate uses \texttt{numel * element\_size} from FakeTensor metadata. The GPU also has: CUDA allocator block rounding (512 bytes or 2 MB), kernel temporary buffers invisible to FX, autograd SavedVariable wrappers, and fragmentation.}
+
+
+\section{Phase 2: AC Selection Algorithm (Slides 18--28)} \timing{$\sim$10 min}
+
+\slide{The Subset Selection Problem}
+\say{Classic optimization: N items, each with a cost and a benefit. Which to select? NP-hard in general. We use the greedy heuristic from mu-TWO.}
+
+\slide{mu-TWO: Background}
+\say{mu-TWO is an MLSys 2023 paper for multi-model training. Its full algorithm considers both swap and recompute. We use only recompute --- appropriate for single-model AC. The ranking metric is recompute ratio: bytes freed per millisecond of extra compute.}
+
+\qa{Why not implement swap too?}{Swap requires modeling PCIe bandwidth and overlap with computation from a second model (the multiplexer). For single-model training without a second model to overlap with, swap offers less benefit. The profiler does measure swap times for future extension.}
+
+\slide{The Greedy Algorithm (Algorithm B)}
+\say{The algorithm: compute baseline peak, set target, check if AC can help at all, then greedily evict the highest-ratio candidate. After each eviction, re-simulate peak. Stop when target is met or no more progress. The memory simulator is the key --- it tells us exactly when we've done enough.}
+
+\slide{Memory Simulator}
+\say{The simulator walks the timeline. Retained tensors are live from production to last use. Evicted tensors are live during forward, FREE during idle, briefly live at recomputation. Peak is the max over all steps. This is why ``memory freed'' exceeds ``peak reduction'' --- evicted tensors are still live in forward.}
+
+\slide{Cascading Recomputation}
+\say{When A is evicted and B depends on A, recomputing B now requires first recomputing A. B's cost goes up, ratio goes down. This prevents runaway chains. From Algorithms E and F in the paper.}
+
+\slide{Early Termination: The BERT Finding}
+\say{BERT's peak is at the optimizer step. No activations alive there. Our quick check detects this and returns immediately. The lesson: not every model benefits from AC. BERT's bottleneck is the optimizer, not activations.}
+
+\qa{How would you fix BERT's memory?}{\texttt{fused=True} Adam (single node instead of hundreds of foreach ops), optimizer state sharding (like ZeRO), or gradient accumulation to reduce batch-level optimizer state.}
+
+\slide{Validation: Input Availability}
+\say{Every recomputed tensor's inputs must be available. Iterate until stable --- moving one back to retained can enable another eviction.}
+
+\slide{Results: ResNet18}
+\say{Peak 506 to 431 MB. Only 8 evictions needed --- all ReLUs. All convolutions retained. 1 ms extra cost.}
+
+\slide{Results: ResNet50 (bs=16)}
+\say{This is the biggest result. Peak drops from 1.64 GB to 1.13 GB --- 514 MB reduction, 31\% of peak. Only 16 evictions. Three early convolutions are evicted because they produce huge 50 MB feature maps but are relatively cheap. All deeper convolutions retained. 2.6 ms extra cost --- excellent trade-off.}
+
+\qa{Why are early convolutions evicted but deeper ones aren't?}{Early convolutions operate on high-resolution inputs (224x224) with few channels, producing large outputs (50 MB) cheaply (0.23 ms). Deeper convolutions have smaller spatial dimensions but more channels --- the outputs are smaller and the computation is heavier. The ratio favors evicting early layers.}
+
+\slide{Results: BERT-base}
+\say{Zero recomputed, 363 retained. AC can't help --- peak is in optimizer. The algorithm correctly detects this.}
+
+\slide{Validation Results}
+\say{Three-level validation: profiler accuracy, AC sanity, simulator consistency. All pass on all models. 55 unit tests.}
+
+
+\section{Wrap-Up (Slides 29--31)} \timing{$\sim$4 min}
+
+\slide{Key Findings}
+\say{Five findings. AC works great for vision models. AC doesn't help BERT with foreach Adam. Profiler accuracy scales with tensor size. Memory simulator is essential. Cascading cost propagation matters.}
+
+\slide{Next Steps: Phase 3}
+\say{Graph rewriting: extract forward subgraph, clone it, insert before first backward use. The starter code provides utilities. Correctness: torch.allclose on gradients.}
+
+\qa{What's the complexity of graph rewriting?}{Linear in the number of evicted nodes times the size of each recomputation subgraph. For ResNet50 with 16 evictions, this is fast --- the subgraphs are small (1--3 nodes each for relu, transpose, getitem).}
+
+\qa{How does this compare to PyTorch's built-in torch.utils.checkpoint?}{torch.utils.checkpoint requires manual annotation. Our approach is automatic. But it requires FX-traceable models and single-iteration profiling.}
+
+\qa{Could you use DP instead of greedy?}{Yes --- 0-1 knapsack formulation. But greedy is O(N\textsuperscript{2}) vs exponential for exact solutions, and sufficient for our models.}
+
+\slide{Questions}
+\say{Happy to take questions or do a live demo.}
+
+\end{document}
