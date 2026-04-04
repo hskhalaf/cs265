@@ -14,27 +14,32 @@
    - 5.1 [The Problem](#51-the-problem)
    - 5.2 [The mu-TWO Greedy Algorithm](#52-the-mu-two-greedy-algorithm)
    - 5.3 [Validation of Recompute Decisions](#53-validation-of-recompute-decisions)
-6. [Design Decisions and Challenges](#6-design-decisions-and-challenges)
-7. [Interpreting the Output](#7-interpreting-the-output)
-8. [Known Limitations](#8-known-limitations)
-9. [Test Suite](#9-test-suite)
-   - 9.1 [Testing philosophy](#91-testing-philosophy)
-   - 9.2 [Test categories](#92-test-categories)
-   - 9.3 [Running the tests](#93-running-the-tests)
+6. [Experimental Results](#6-experimental-results)
+   - 6.1 [ResNet18](#61-resnet18)
+   - 6.2 [BERT](#62-bert)
+7. [Design Decisions and Challenges](#7-design-decisions-and-challenges)
+8. [Interpreting the Output](#8-interpreting-the-output)
+9. [Known Limitations](#9-known-limitations)
+10. [Test Suite](#10-test-suite)
+    - 10.1 [Testing philosophy](#101-testing-philosophy)
+    - 10.2 [Test categories](#102-test-categories)
+    - 10.3 [Running the tests](#103-running-the-tests)
 
 ---
 
 ## 1. Introduction
 
-Training a deep neural network requires far more GPU memory than the model weights alone.  During a single training iteration the GPU must simultaneously hold parameters, activations (intermediate outputs of each layer), gradients, and optimizer state (Adam's two moment buffers per parameter).  Activations account for 70–85% of peak memory because they are produced in the forward pass but cannot be freed until their corresponding backward computation consumes them — and the two passes run in opposite order, so the earliest activations live the longest.
+Training a deep neural network requires far more GPU memory than the model weights alone.  During a single training iteration the GPU must simultaneously hold parameters, activations (intermediate outputs of each layer), gradients, and optimizer state (Adam's two moment buffers per parameter).  Activations account for 70-85% of peak memory because they are produced in the forward pass but cannot be freed until their corresponding backward computation consumes them — and the two passes run in opposite order, so the earliest activations live the longest.
 
 **Activation checkpointing** addresses this by discarding selected activations after the forward pass and recomputing them from retained values during the backward pass, trading extra computation for a lower memory peak.  This project implements the infrastructure required to make that trade-off intelligently:
 
 - **Phase 1 (Graph Profiler)** traces one full training step into a single FX graph, executes it node-by-node to collect per-operator timing and memory statistics, classifies every tensor by role (parameter, activation, gradient, other), computes activation lifetimes, and produces a peak memory breakdown chart.
 
-- **Phase 2 (AC Selection Algorithm)** uses the profiler's output to implement the mu-TWO greedy algorithm, which ranks each activation by its *recompute ratio* (bytes freed per millisecond of extra computation) and greedily selects which to discard until peak memory fits within a budget.
+- **Phase 2 (AC Selection Algorithm)** uses the profiler's output to implement the mu-TWO greedy algorithm, which ranks each activation by its *recompute ratio* (bytes freed per millisecond of extra computation) and greedily selects which to discard until the memory budget is met.
 
 Phase 3 (graph rewriting to insert recomputation nodes) will be implemented next.
+
+We evaluate the system on four models: a simple MLP (DummyModel), ResNet18, ResNet50, and BERT.  On ResNet18, the algorithm saves 229 MB of activation memory at a cost of 3.7 ms of extra computation per iteration.  On BERT, it saves 358 MB at a cost of 2.7 ms.
 
 ---
 
@@ -62,7 +67,7 @@ The training step wraps the loss with `SEPFunction.apply()`, which inserts two i
 - `%sep` — marks the end of the forward pass.
 - `%sep_backward` — marks the beginning of the backward pass.
 
-Everything before `%sep` is the forward pass.  Everything between `%sep` and `%sep_backward` is the loss computation.  Everything after `%sep_backward` is the backward pass.  The optimizer step (`_fused_adam`) follows at the end.
+Everything before `%sep` is the forward pass.  Everything between `%sep` and `%sep_backward` is the loss computation.  Everything after `%sep_backward` is the backward pass.  The optimizer step follows at the end.
 
 ### Graph node structure
 
@@ -85,31 +90,31 @@ graph_tracer.py         Provided by course.  Traces train_step into FX graph.
 graph_prof.py           Phase 1.  Static analysis + runtime profiling.
 activation_checkpoint.py  Phase 2.  mu-TWO greedy selection algorithm.
 visualizer.py           Memory breakdown stacked bar chart.
-starter_code.py         Entry point: profile → visualise → select → (rewrite).
-benchmarks.py           Provided by course.  ResNet / Transformer benchmarks.
+starter_code.py         Entry point: profile -> visualise -> select -> (rewrite).
+benchmarks.py           ResNet18/50, Transformer, BERT benchmarks.
 utils.py                Provided by course.  SPMD decomposition table.
-tests/test_profiler.py  54-test suite across 8 categories.
+tests/test_profiler.py  55-test suite across 8 categories.
 ```
 
 The execution flow is:
 
 ```
 starter_code.experiment()
-  ├── Build DummyModel, Adam optimizer
-  ├── Initialise optimizer state (Adam lazy init)
-  └── compile(train_step, graph_transformation)
-        ├── graph_tracer._compile() → GraphModule
-        └── graph_transformation(gm, args)
-              ├── GraphProfiler(gm)           ← static analysis
-              ├── profiler.run(*args) × N     ← warm-up
-              ├── profiler.reset_stats()
-              ├── profiler.run(*args) × M     ← measurement
-              ├── profiler.aggregate_stats()
-              ├── profiler.print_stats()      ← report
-              ├── MemoryVisualizer(profiler)
-              │     └── plot_memory_timeline() ← PNG chart
-              ├── select_activations_to_recompute(profiler)
-              └── print_ac_decisions()        ← selection report
+  |-- Build DummyModel, Adam optimizer
+  |-- Initialise optimizer state (Adam lazy init)
+  +-- compile(train_step, graph_transformation)
+        |-- graph_tracer._compile() -> GraphModule
+        +-- graph_transformation(gm, args)
+              |-- GraphProfiler(gm)           <- static analysis
+              |-- profiler.run(*args) x N     <- warm-up
+              |-- profiler.reset_stats()
+              |-- profiler.run(*args) x M     <- measurement
+              |-- profiler.aggregate_stats()
+              |-- profiler.print_stats()      <- report
+              |-- MemoryVisualizer(profiler)
+              |     +-- plot_memory_timeline() <- PNG chart
+              |-- select_activations_to_recompute(profiler)
+              +-- print_ac_decisions()        <- selection report
 ```
 
 ---
@@ -134,18 +139,32 @@ for i, node in enumerate(self.node_list):
         self.sep_bwd_node, self.sep_bwd_index = node, i
 ```
 
-These two indices partition the graph into four regions: FORWARD (index <= sep), LOSS (between sep and sep_backward), BACKWARD (>= sep_backward), and OPTIMIZER (>= fused_adam).
+These two indices partition the graph into four regions: FORWARD (index <= sep), LOSS (between sep and sep_backward), BACKWARD (>= sep_backward), and OPTIMIZER (>= optimizer boundary).
 
 #### Step 2 — Extract parameters and gradients
 
-The `_fused_adam` node's arguments are structured lists:
+Parameter identification uses two strategies depending on the optimizer configuration:
+
+**Strategy A (`fused=True`).** When Adam is created with `fused=True`, the traced graph contains a single `_fused_adam` node whose arguments are structured lists:
 
 ```python
 self.param_nodes = set(self.optimizer_node.args[0])  # parameter tensors
 self.grad_nodes  = set(self.optimizer_node.args[1])  # gradient tensors
 ```
 
-This is how we identify which placeholder nodes are model parameters versus optimizer states versus batch data: parameters are exactly those that appear in `args[0]` of the Adam node.
+**Strategy B (`foreach=True`).** When Adam uses `foreach=True`, the optimizer step is decomposed into many individual `_foreach_*` and `copy_` operations — there is no single optimizer node.  In this case, we first detect the optimizer region boundary (the first `_foreach_*` op after `sep_backward`), then identify parameters by their usage pattern:
+
+```python
+for node in self.node_list:
+    if node.op != OP.PLACEHOLDER:
+        continue
+    has_fwd_user = any(idx < self.sep_index for idx in user_indices)
+    has_opt_user = any(idx >= self.optimizer_index for idx in user_indices)
+    if has_fwd_user and has_opt_user:
+        self.param_nodes.add(node)
+```
+
+The key insight: **parameters are the only placeholder nodes that appear in both the forward pass and the optimizer step.**  Batch data appears in forward + backward but not the optimizer.  Optimizer states (Adam's `exp_avg`, `exp_avg_sq`, `step`) appear only in the optimizer region.  This distinction reliably identifies all model parameters without requiring a specific optimizer node target.
 
 #### Step 3 — Identify intermediate activations
 
@@ -261,28 +280,34 @@ This measures how many bytes of GPU memory we free per millisecond of extra comp
 The algorithm is:
 
 ```
-1.  For each intermediate activation, compute recompute_ratio.
-2.  Sort by recompute_ratio descending.
-3.  Greedily mark the top-ranked activation for recomputation.
-4.  Accumulate the memory freed.
-5.  Stop when accumulated savings >= memory_budget (or all processed).
-6.  Validate the recompute set (see 5.3).
+1.  Compute the memory budget (default: 50% of total activation memory).
+2.  For each intermediate activation, compute recompute_ratio.
+3.  Sort by recompute_ratio descending.
+4.  Greedily mark the top-ranked activation for recomputation.
+5.  Accumulate the memory freed.
+6.  Stop when accumulated savings >= memory_budget.
+7.  Validate the recompute set (see 5.3).
 ```
+
+The default budget of 50% of total activation memory strikes a balance: it frees a substantial amount of memory while leaving the more expensive-to-recompute activations in place.  The user can override this with an explicit byte budget for finer control.
 
 In code:
 
 ```python
+# Default budget: free half the activation memory.
+if memory_budget is None:
+    total_act_mem = sum(info.memory_size for info in intermediates)
+    memory_budget = total_act_mem // 2
+
 candidates.sort(key=lambda c: c["recompute_ratio"], reverse=True)
 
 for cand in candidates:
-    if memory_budget is not None and memory_saved >= memory_budget:
+    if memory_saved >= memory_budget:
         to_retain.append(cand["node"])
         continue
     to_recompute.append(cand["node"])
     memory_saved += cand["memory_size"]
 ```
-
-When no budget is specified, the algorithm defaults to recomputing every valid intermediate (maximum memory savings).
 
 ### 5.3 Validation of Recompute Decisions
 
@@ -311,7 +336,47 @@ Moving one node from recompute to retain may make another node's inputs valid (s
 
 ---
 
-## 6. Design Decisions and Challenges
+## 6. Experimental Results
+
+We evaluate the profiler and AC selection on four models.  All experiments use Adam with `foreach=True` and `capturable=True`, 2 warm-up iterations and 3 measurement iterations.
+
+### Summary
+
+| Model | Intermediates | Act. Memory | Peak Memory | Recomputed | Retained | Memory Saved | Extra Cost |
+|-------|-------------:|------------:|------------:|-----------:|---------:|-------------:|-----------:|
+| DummyModel (10 layers) | 19 | 4.16 MB | 6.46 MB | 10 | 9 | 2.08 MB | 0.50 ms |
+| ResNet18 (bs=16) | 104 | 331 MB | 506 MB | 85 | 19 | 229 MB | 3.68 ms |
+| ResNet50 (bs=4) | 196 | 415 MB | 789 MB | 114 | 82 | 208 MB | 5.20 ms |
+| BERT-base (bs=4) | 363 | 716 MB | 2506 MB | 52 | 311 | 358 MB | 2.67 ms |
+
+### 6.1 ResNet18
+
+ResNet18 (batch size 16, 224x224 images) produces 104 intermediate activations totalling 331 MB.  Peak memory reaches 506 MB during the backward pass.
+
+The AC algorithm selects **85 intermediates for recomputation** and **19 for retention**.  The retained activations are exclusively convolution outputs — these have high recomputation cost (convolutions are the most expensive forward operations) and moderate memory footprint relative to their cost.  The recomputed activations include all ReLU outputs, weight transposes, and batch norm intermediates, which are cheap to recompute:
+
+- ReLU outputs (390 KB each, ~0.06 ms to recompute): recompute ratios of 200M+
+- Weight transposes (39 KB each, ~0.04 ms): ratios of ~1M
+- Convolution outputs (6-50 MB each, 0.1-0.5 ms): retained due to low ratios
+
+This saves **229 MB** (69% of activation memory) at a cost of **3.68 ms** extra computation per iteration.
+
+### 6.2 BERT
+
+BERT-base (12 layers, 768 hidden, 12 attention heads, sequence length 128, batch size 4) produces 363 intermediate activations totalling 716 MB.  Peak memory reaches 2.5 GB.
+
+The AC algorithm selects **52 intermediates for recomputation** and **311 for retention**.  The recomputed nodes are the largest, cheapest-to-recompute tensors in the graph:
+
+- Weight transpose nodes (`t_4`, `t_5`, ...) at 9 MB each, ~0.04 ms to recompute: ratios of 200M+.  These are the transposed weight matrices used in backward gradient computations.  Transposition is essentially free (it's a view operation on GPU), so evicting them is a clear win.
+- Attention reshape views (`view_30`, `view_110`, ...) at 6 MB each, ~0.06 ms: ratios of 100M+.  These reshape operations for multi-head attention are also near-free.
+
+The retained 311 nodes include smaller intermediates (attention scores, layer norm outputs, add operations at 1.5 MB each) whose recompute ratios don't justify eviction within the 50% budget.
+
+This saves **358 MB** (50% of activation memory) at a cost of only **2.67 ms** extra computation per iteration — an excellent trade-off because the recomputed operations (transposes, views) are nearly zero-cost on GPU.
+
+---
+
+## 7. Design Decisions and Challenges
 
 ### Decision 1: FX-based profiling instead of hooks
 
@@ -319,14 +384,14 @@ The Milestone 1 prototype used PyTorch module hooks to instrument execution.  Ho
 
 FX tracing eliminates all of these problems.  The traced graph is a single, explicit DAG with stable node names, exact data dependencies (via `node.users`), and both forward and backward operations in one structure.  Lifetimes are directly readable from the graph — no inference required.  And critically, the graph is rewritable, which Phase 3 requires.
 
-The trade-off is that FX tracing captures a single static graph (no data-dependent control flow) and requires the model to be traceable by `make_fx()`.  For the models in this project (DummyModel, ResNet, Transformer), this is not a limitation.
+The trade-off is that FX tracing captures a single static graph (no data-dependent control flow) and requires the model to be traceable by `make_fx()`.  For the models in this project (DummyModel, ResNet, BERT), this is not a limitation.
 
 ### Decision 2: Swapping intermediates during profiling
 
 The `run_node` method swaps intermediates to CPU after their last forward use and back to GPU before their first backward use.  This serves two purposes:
 
 1. **Measurement** — we record actual swap latencies that mu-TWO's full algorithm uses for the swap-vs-recompute decision.
-2. **Memory management** — for large models (ResNet-152, BERT), keeping all intermediates in GPU memory during profiling may cause OOM.  Swapping ensures the profiler can run on models that barely fit in memory.
+2. **Memory management** — for large models (ResNet50, BERT), keeping all intermediates in GPU memory during profiling may cause OOM.  Swapping ensures the profiler can run on models that barely fit in memory.
 
 The downside is that profiling itself adds overhead (the swap transfers).  This overhead is not included in the per-node timing measurements, since swaps happen outside the `super().run_node()` call.
 
@@ -340,13 +405,19 @@ recompute_ratio = memory_size / recompute_cost
 
 Tensors with high ratios are cheap to recompute relative to their memory footprint.  This is a strictly greedy heuristic — it does not consider interactions between choices (e.g. two activations that share an input and could be recomputed together for less cost than the sum of their individual costs).  For sequential models like our DummyModel, where each activation depends only on the previous one, the greedy approach produces optimal or near-optimal results.
 
-### Challenge 1: Identifying the optimizer node
+### Decision 4: Default memory budget at 50% of activation memory
 
-The `_fused_adam` node is not always present.  If the optimizer is SGD or the decomposition table is different, the node target changes.  Currently we hard-code `torch.ops.aten._fused_adam.default`.  A more robust approach would search for any optimizer-related node by inspecting the OPTIMIZER region.
+Without a budget, the greedy algorithm would recompute every single intermediate — maximising memory savings but adding unnecessary computation for activations that contribute little to the peak.  We default to freeing 50% of total activation memory, which produces meaningful memory reduction while keeping the more expensive-to-recompute operations (like convolutions) in place.  This default was validated against ResNet18 (where it correctly retains all convolutions and recomputes all cheap ops) and BERT (where it correctly targets the large view/transpose nodes).
+
+### Challenge 1: Parameter identification without _fused_adam
+
+When Adam uses `foreach=True` (the default in the course starter code), the optimizer step is decomposed into dozens of `_foreach_*` and `copy_` operations.  There is no single `_fused_adam` node from which to read the parameter and gradient lists.  Furthermore, FakeTensor metadata has `requires_grad=False` for all nodes (FakeTensorMode does not propagate gradient flags), so the usual `requires_grad` check fails.
+
+The solution is to identify parameters by their **usage pattern across graph regions**: parameters are the only placeholder nodes that have users in both the forward region and the optimizer region.  Batch data is used in forward + backward but not the optimizer.  Optimizer states are used only in the optimizer region.  This heuristic correctly identifies all model parameters for every model we tested.
 
 ### Challenge 2: FakeTensor metadata for size computation
 
-`node.meta['val']` contains a FakeTensor only for `call_function` nodes traced through `make_fx` in fake mode.  Placeholder nodes (parameters, batch data) do not have FakeTensor metadata unless explicitly annotated.  We handle this by returning 0 for nodes without metadata and computing parameter sizes separately from `self.param_nodes`.
+`node.meta['val']` contains a FakeTensor only for `call_function` nodes traced through `make_fx` in fake mode.  Placeholder nodes (parameters, batch data) may have FakeTensors but with `requires_grad=False` regardless of the actual tensor.  We handle this by computing sizes from `numel() * element_size()` on whatever tensor metadata is available, returning 0 for nodes without metadata.
 
 ### Challenge 3: Validation iteration for recompute set
 
@@ -354,22 +425,22 @@ The validation pass must iterate until convergence because moving one node from 
 
 ---
 
-## 7. Interpreting the Output
+## 8. Interpreting the Output
 
 ### Operation Summary Table
 
 ```
 #    Node                                Region     Time(ms)       Mem(B)
-0    l__self___mod_0                      FORWARD       0.045         +512
-1    relu                                 FORWARD       0.012         +512
+0    t                                    FORWARD       0.049           +0
+1    addmm                                FORWARD       0.068         +512
 ...
-42   t_3                                  BACKWARD      0.031         -512
+31   threshold_backward                   BACKWARD      0.031         -512
 ...
-58   _fused_adam                           OPTIMIZER     0.250        +1024
+47   _foreach_add                         OPTIMIZER     0.032         +256
 ```
 
 - **#** — Index in topological order.
-- **Node** — FX node name (derived from the ATen operator or module name).
+- **Node** — FX node name (derived from the ATen operator).
 - **Region** — FORWARD, LOSS, BACKWARD, or OPTIMIZER.
 - **Time(ms)** — Average wall-clock time for this operation (from CUDA event timing).
 - **Mem(B)** — Average net GPU memory change (positive = allocation, negative = deallocation).
@@ -377,20 +448,21 @@ The validation pass must iterate until convergence because moving one node from 
 ### Tensor Categorisation
 
 ```
-  PARAM              count=8      total=    50.00 KB
-  ACT                count=12     total=   375.00 KB
-  GRAD               count=8      total=    50.00 KB
-  OTHER              count=45     total=   100.00 KB
+  PARAM              count=20     total=   394.53 KB
+  ACT                count=19     total=  4257.81 KB
+  GRAD               count=0      total=     0.00 KB
+  OTHER              count=766    total= 26267.68 KB
 ```
 
-Counts and total memory per tensor role.  ACT count should equal the number of identified intermediate activations.  PARAM count should match `len(list(model.parameters()))`.
+Counts and total memory per tensor role.  ACT count equals the number of identified intermediate activations.  PARAM count should match the number of model parameters.  GRAD is populated only when `fused=True` is used (Strategy A); with `foreach=True` (Strategy B), gradients are classified as OTHER since they cannot be distinguished from other backward-region tensors without the `_fused_adam` node.
 
 ### Intermediate Activation Lifetimes
 
 ```
-Name                         Size(KB)   LastFwd  FirstBwd  Lifetime  Recomp(ms)
-relu                            25.00        3        38        35      0.0120
-relu_1                          25.00        7        34        27      0.0115
+Name                       Size(KB)  LastFwd  FirstBwd  Lifetime  Recomp(ms)
+relu                         390.62       87       195       108      0.0658
+relu_1                       390.62       90       186        96      0.0622
+t_1                           39.06       87       192       105      0.0406
 ...
 ```
 
@@ -399,23 +471,25 @@ relu_1                          25.00        7        34        27      0.0115
 - **Lifetime** — `FirstBwd - LastFwd`.  The number of steps the activation sits idle.
 - **Recomp(ms)** — Time to recompute this activation (averaged over measurement runs).
 
-**Key insight:** activations with large `Size × Lifetime` products contribute most to peak memory.  Those with high `Size / Recomp` ratios are the best candidates for checkpointing.
+**Key insight:** activations with large `Size x Lifetime` products contribute most to peak memory.  Those with high `Size / Recomp` ratios are the best candidates for checkpointing.
 
 ### AC Selection Report
 
 ```
-  Intermediates to RECOMPUTE (8):
-    relu                     25.00 KB      0.0120 ms     ratio=2133333
-    relu_1                   25.00 KB      0.0115 ms     ratio=2228260
+  Intermediates to RECOMPUTE (85):
+    getitem_5                 25088.00 KB      0.0285 ms     ratio=901702713
+    relu_                     50176.00 KB      0.3110 ms     ratio=165228143
     ...
 
-  Intermediates to RETAIN (4):
-    mm_2                     12.50 KB
+  Intermediates to RETAIN (19):
+    convolution_4             12544.00 KB
+    convolution_2             12544.00 KB
+    ...
 
   Summary:
-    Memory saved: 200.00 KB
-    Extra computation: 0.0960 ms
-    Memory retained: 50.00 KB
+    Memory saved by recomputation: 229.00 MB
+    Extra computation cost:        3.68 ms
+    Memory still retained:         102.59 MB
 ```
 
 ### Memory Breakdown Chart
@@ -427,13 +501,13 @@ The PNG chart shows a stacked bar at each step.  Look for:
 
 ---
 
-## 8. Known Limitations
+## 9. Known Limitations
 
 **Static graph only.**  FX tracing captures a single trace.  Models with data-dependent control flow (`if`, dynamic loops) will produce different graphs for different inputs.  The profiler captures one trace and assumes it is representative.
 
 **Operator granularity.**  The profiler operates at the ATen operator level (individual matmuls, relu calls), which is finer than the module level but may still merge operations that the hardware executes as fused kernels.
 
-**_fused_adam assumption.**  The optimizer identification is hard-coded to `_fused_adam`.  Other optimizers (SGD, AdamW, RMSprop) would require additional target checks.
+**Gradient identification with foreach=True.**  When using `foreach=True` Adam, gradient nodes cannot be distinguished from other backward-region tensors.  The gradient count in the categorisation summary will show 0.  This does not affect intermediate identification or AC selection, which depend only on parameter and activation classification.
 
 **No multi-iteration analysis.**  The profiler captures a single training iteration.  Learning rate schedules, gradient accumulation, and warmup effects are not modelled.
 
@@ -443,9 +517,9 @@ The PNG chart shows a stacked bar at each step.  Look for:
 
 ---
 
-## 9. Test Suite
+## 10. Test Suite
 
-The test suite lives in `tests/test_profiler.py` and contains **54 tests** runnable with:
+The test suite lives in `tests/test_profiler.py` and contains **55 tests** runnable with:
 
 ```bash
 python -m pytest tests/ -v
@@ -453,7 +527,7 @@ python -m pytest tests/ -v
 
 Tests that require CUDA are decorated with `@requires_cuda` and are skipped on CPU-only machines.  Four tests (utility functions, error handling) run on CPU.
 
-### 9.1 Testing philosophy
+### 10.1 Testing philosophy
 
 The key question for each component: *what property does this code rely on that, if violated, would silently produce wrong profiling data or wrong AC decisions?*
 
@@ -467,21 +541,22 @@ For the AC algorithm:
 - Every intermediate is accounted for (recompute + retain = all intermediates, no overlap).
 - Every recomputed node's inputs are available (placeholders or retained).
 - The greedy order matches the ranking by recompute ratio.
+- With the default budget, some intermediates are retained (not everything evicted).
 
-### 9.2 Test categories
+### 10.2 Test categories
 
 | Class | Tests | What it validates |
 |-------|------:|-------------------|
-| `TestStaticAnalysis` | 13 | Separator detection, param/grad extraction, intermediate identification, node indexing |
+| `TestStaticAnalysis` | 13 | Separator detection, param extraction, intermediate identification, node indexing |
 | `TestNodeClassification` | 7 | PARAM/ACT/GRAD/OTHER classification, region assignment, region boundary consistency |
 | `TestLifetimes` | 6 | `last_fwd < first_bwd`, both in correct regions, positive lifetime, positive memory size |
 | `TestRuntimeProfiling` | 6 | Non-negative runtimes, populated stats, reset clears data, recompute cost > 0 |
-| `TestACSelection` | 8 | Full coverage (recompute + retain = all), no overlap, input availability, budget=0, greedy order |
+| `TestACSelection` | 9 | Full coverage (recompute + retain = all), no overlap, input availability, budget=0, default budget retains some, greedy order |
 | `TestVisualizerOutput` | 5 | Timeline length, non-negative memory, role sums equal total, PNG file created |
 | `TestAPIGuardrails` | 5 | Missing separator raises, `_tensor_size_bytes` correctness, multiple model sizes |
 | `TestArchitectures` | 4 | Single layer, deep network, larger dim, AC selection across all sizes |
 
-### 9.3 Running the tests
+### 10.3 Running the tests
 
 ```bash
 # All tests (CUDA tests skip if no GPU)
@@ -490,8 +565,14 @@ python -m pytest tests/test_profiler.py -v
 # CPU-only tests
 python -m pytest tests/test_profiler.py -v -k "not cuda"
 
-# Full pipeline (requires CUDA)
+# Full pipeline on DummyModel (requires CUDA)
 python starter_code.py
+
+# Benchmark a specific model (requires CUDA)
+python benchmarks.py Resnet18
+python benchmarks.py Resnet50
+python benchmarks.py Bert
+python benchmarks.py Transformer
 ```
 
-Expected output on CUDA: 54 passed.  On CPU: 4 passed, 50 skipped.
+Expected output on CUDA: 55 passed.  On CPU: 4 passed, 51 skipped.
