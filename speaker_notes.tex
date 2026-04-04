@@ -161,7 +161,15 @@
 \qa{How would you fix BERT's memory?}{\texttt{fused=True} Adam (single node instead of hundreds of foreach ops), optimizer state sharding (like ZeRO), or gradient accumulation to reduce batch-level optimizer state.}
 
 \slide{Validation: Input Availability}
-\say{Every recomputed tensor's inputs must be available. Iterate until stable --- moving one back to retained can enable another eviction.}
+\say{This is the final safety check after the greedy algorithm picks which tensors to evict. Here's the problem: say the algorithm evicts both tensor A and tensor B, but B's computation requires A as an input --- for example, \texttt{B = relu(A)}. During backward, when we need B, we'd try to recompute it. But A was also evicted, so A isn't in memory either. The recomputation would fail.}
+
+\say{The rule: to recompute a tensor, every input to the operation that produced it must be available in GPU memory. Available means either it's a placeholder --- parameters, batch data, these are always in memory --- or it's a retained intermediate, one we chose to keep.}
+
+\say{The loop: scan all evicted nodes. If any evicted node has an evicted input, move it back to the retained set. But moving one node back might fix another node's dependency, so we loop until nothing changes. In practice it converges in one or two iterations.}
+
+\say{Concrete example: say we evicted both \texttt{mm} (a matmul) and \texttt{relu} where \texttt{relu = relu(mm)}. The validation finds that \texttt{relu} depends on \texttt{mm} which is also evicted --- invalid. It moves \texttt{relu} back to retained. Now \texttt{mm}'s own inputs are placeholders (weight matrices), so \texttt{mm} stays evicted. Final result: \texttt{mm} evicted, \texttt{relu} retained.}
+
+\qa{Does this ever undo many evictions?}{Rarely. The greedy algorithm already avoids this via cascading cost propagation --- if evicting A made B expensive, B's ratio dropped and it probably wasn't evicted in the first place. The validation is a safety net for edge cases the ratio didn't catch.}
 
 \slide{Results: ResNet18}
 \say{Peak 506 to 431 MB. Only 8 evictions needed --- all ReLUs. All convolutions retained. 1 ms extra cost.}
