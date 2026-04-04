@@ -1,10 +1,11 @@
 """
-Benchmark harness for profiling real models (ResNet18, ResNet50, Transformer).
+Benchmark harness for profiling real models.
 
 Usage:
     python benchmarks.py                    # default: ResNet18
     python benchmarks.py Resnet50           # specify model
     python benchmarks.py Transformer        # Transformer model
+    python benchmarks.py Bert               # BERT model (requires: pip install transformers)
 """
 
 import sys
@@ -33,12 +34,14 @@ model_names: List[str] = [
     "Transformer",
     "Resnet18",
     "Resnet50",
+    "Bert",
 ]
 
 model_batch_sizes: Dict[str, int] = {
     "Transformer": 4,
     "Resnet18": 16,
     "Resnet50": 4,
+    "Bert": 4,
 }
 
 
@@ -106,6 +109,60 @@ class Experiment:
                 foreach=True, capturable=True,
             )
             self.train_step = resnet_train_step
+
+        elif self.model_name == "Bert":
+            from transformers import BertConfig, BertForSequenceClassification
+
+            num_classes = 2
+            seq_len = 128
+            config = BertConfig(
+                vocab_size=30522,
+                hidden_size=768,
+                num_hidden_layers=12,
+                num_attention_heads=12,
+                intermediate_size=3072,
+                max_position_embeddings=512,
+                num_labels=num_classes,
+                # Disable features that break FX tracing.
+                torchscript=True,
+            )
+            self.model = BertForSequenceClassification(config).to(dev)
+
+            input_ids = torch.randint(
+                0, config.vocab_size, (self.batch_size, seq_len), device=dev,
+            )
+            attention_mask = torch.ones(
+                self.batch_size, seq_len, dtype=torch.long, device=dev,
+            )
+            labels = torch.randint(
+                0, num_classes, (self.batch_size,), device=dev,
+            )
+            self.example_inputs = (input_ids, attention_mask, labels)
+
+            def bert_train_step(
+                model: nn.Module, optim: optim.Optimizer, example_inputs: Any,
+            ):
+                input_ids, attention_mask, labels = (
+                    example_inputs[0],
+                    example_inputs[1],
+                    example_inputs[2],
+                )
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                loss = outputs.loss
+                loss = SEPFunction.apply(loss)
+                loss.backward()
+                optim.step()
+                optim.zero_grad()
+
+            self.optimizer = optim.Adam(
+                self.model.parameters(), lr=1e-2,
+                foreach=True, capturable=True,
+            )
+            self.train_step = bert_train_step
 
     def loss_fn(self, logits: torch.Tensor, targets: torch.Tensor):
         return F.cross_entropy(
