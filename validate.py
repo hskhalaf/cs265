@@ -52,7 +52,7 @@ def _setup_model(name: str):
         model = DummyModel(layers=10, dim=100).to(dev)
         batch = torch.randn(1000, 100, device=dev)
         opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
-        inputs = (batch,)
+        example_inputs = batch  # single tensor
 
         def train_step(model, optim, batch):
             loss = model(batch).sum()
@@ -61,7 +61,7 @@ def _setup_model(name: str):
             optim.step()
             optim.zero_grad()
 
-        return model, opt, inputs, train_step
+        return model, opt, example_inputs, train_step
 
     elif name == "Resnet18":
         from torchvision.models import resnet18
@@ -71,7 +71,7 @@ def _setup_model(name: str):
         inp = torch.randn(16, 3, 224, 224, device=dev)
         target = torch.randint(0, 10, (16,), device=dev)
         opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
-        inputs = (inp, target)
+        example_inputs = (inp, target)  # tuple
 
         def train_step(model, optim, example_inputs):
             logits = model(example_inputs[0])
@@ -81,7 +81,7 @@ def _setup_model(name: str):
             optim.step()
             optim.zero_grad()
 
-        return model, opt, inputs, train_step
+        return model, opt, example_inputs, train_step
 
     else:
         raise ValueError(f"Unknown model: {name}")
@@ -94,7 +94,7 @@ def _setup_model(name: str):
 
 def _build_profiler(name: str) -> Tuple[GraphProfiler, list]:
     """Trace, profile, and return (profiler, args)."""
-    model, opt, inputs, train_step = _setup_model(name)
+    model, opt, example_inputs, train_step = _setup_model(name)
 
     # Init optimizer state.
     for p in model.parameters():
@@ -111,7 +111,7 @@ def _build_profiler(name: str) -> Tuple[GraphProfiler, list]:
         return gm
 
     compiled_fn = gt_compile(train_step, capture)
-    compiled_fn(model, opt, *inputs)
+    compiled_fn(model, opt, example_inputs)
 
     profiler = GraphProfiler(captured["gm"])
     args = captured["args"]
