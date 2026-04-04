@@ -218,10 +218,17 @@ class GraphProfiler(fx.Interpreter):
         self.optimizer_node: Optional[fx.Node] = None
         self.optimizer_index: int = -1
 
+        # Search for known optimizer node targets.  _fused_adam is used when
+        # Adam(fused=True); _foreach_add_.List is the first foreach op when
+        # Adam(foreach=True) decomposes through SPMD_DECOMP_TABLE.
+        _OPTIMIZER_TARGETS = {
+            torch.ops.aten._fused_adam.default,
+        }
+
         for i, node in enumerate(self.node_list):
             if (
                 node.op == OP.CALL_FUNCTION
-                and node.target == torch.ops.aten._fused_adam.default
+                and node.target in _OPTIMIZER_TARGETS
             ):
                 self.optimizer_node = node
                 self.optimizer_index = i

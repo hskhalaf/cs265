@@ -85,7 +85,7 @@ def _build_profiler(
     model = DummyModel(layers=layers, dim=dim).to(device)
     batch = torch.randn(batch_size, dim, device=device)
     opt = torch.optim.Adam(
-        model.parameters(), lr=0.01, foreach=True, capturable=True,
+        model.parameters(), lr=0.01, fused=True, capturable=True,
     )
 
     # Initialise optimizer state (Adam lazy init).
