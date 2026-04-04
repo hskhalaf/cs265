@@ -3,7 +3,6 @@ title: "Activation Checkpointing"
 subtitle: "CS265 Systems Project Midterm Check-in"
 author: "Hadi Khalaf"
 date: "Spring 2026"
-institute: "Harvard University"
 theme: "Madrid"
 colortheme: "dolphin"
 fonttheme: "structurebold"
@@ -26,9 +25,9 @@ header-includes:
 
 \tableofcontents
 
-## The Memory Problem in DNN Training
+## The Memory Problem in Deep Neural Net Training
 
-A single training iteration requires **four types** of GPU memory:
+A single training iteration requires **four main types** of GPU memory:
 
 \begin{center}
 \begin{tikzpicture}[scale=0.85, every node/.style={font=\small}]
@@ -42,10 +41,9 @@ A single training iteration requires **four types** of GPU memory:
 \end{tikzpicture}
 \end{center}
 
-- GPU memory has grown **linearly**; model sizes grow **exponentially**
-- Memory is the bottleneck limiting batch size and model scale
+Memory is the bottleneck limiting larger batch size and model scale
 
-## Why Activations Dominate Peak Memory
+## Why Activations (Often) Dominate Peak Memory
 
 \begin{center}
 \begin{tikzpicture}[scale=0.7, every node/.style={font=\footnotesize}]
@@ -72,13 +70,15 @@ A single training iteration requires **four types** of GPU memory:
 \end{tikzpicture}
 \end{center}
 
-- Forward produces Z1, Z2, ...; backward consumes them in **reverse order**
-- Z1 produced **first**, consumed **last** $\Rightarrow$ longest lifetime
-- All activations accumulate simultaneously at peak
+- The forward pass produces Z1, ... while the backward  pass consumes them in reverse order. 
+- **Example:** Z1 has the longest lifetime
+- At the end of the forward pass, all activations are still in memory simultaneously.
 
 ## Activation Checkpointing: The Idea
 
-**Trade compute for memory:** discard selected activations after forward, recompute during backward.
+**Idea: Trade compute for memory!** 
+
+Discard selected activations after the forward pass and recompute during backward.
 
 \begin{center}
 \begin{tikzpicture}[scale=0.7, every node/.style={font=\footnotesize}]
@@ -102,17 +102,17 @@ A single training iteration requires **four types** of GPU memory:
 
 - **Retain** expensive activations (convolutions)
 - **Discard** cheap activations (ReLU, transpose)
-- The question: **which to discard?** $\Rightarrow$ Phase 2 (mu-TWO algorithm)
+- The question: **which to discard?** $\Rightarrow$ This is the idea behind Phase 2 ($\mu$-TWO algorithm)
 
 ## Project Overview
 
 Three phases:
 
-| Phase | Task | Weight | Status |
-|-------|------|--------|--------|
-| 1 | **Graph Profiler** --- timing, memory, tensor classification, lifetimes | 35% | Done |
-| 2 | **AC Selection** --- mu-TWO greedy subset selection | 20% | Done |
-| 3 | **Graph Rewriter** --- subgraph extraction, recomputation insertion | 45% | Next |
+| Phase | Task | Status |
+|-------|------|-------|
+| 1 | **Graph Profiler**  | Done |
+| 2 | **AC Selection** | Done |
+| 3 | **Graph Rewriter** | Next |
 
 \vspace{0.5em}
 
@@ -122,11 +122,10 @@ Models evaluated: **DummyModel**, **ResNet18**, **ResNet50**, **BERT-base**
 
 ## Background: Why FX Tracing?
 
-**Previous approach (Milestone 1):** PyTorch module hooks
+**Previous approach I had used:** PyTorch module hooks
 
-- Must reconstruct graph, track tensor identity, infer implicit autograd saves
-- 4-pass static analysis for lifetimes
-- **Not rewritable** $\Rightarrow$ can't insert recomputation nodes
+- Must reconstruct graph, track tensor identity, and infer implicit autograd saves
+- **Not rewritable**, i.e., can't insert recomputation nodes
 
 \vspace{0.5em}
 
@@ -141,45 +140,28 @@ Models evaluated: **DummyModel**, **ResNet18**, **ResNet50**, **BERT-base**
 ## The Traced Graph Structure
 
 \begin{center}
-\begin{tikzpicture}[scale=0.7, every node/.style={font=\small},
-  block/.style={draw, rounded corners, minimum width=6cm, minimum height=0.5cm, fill=#1}]
-  \node[block=gray!15]  (ph)  at (0, 4.2) {PLACEHOLDER --- params, opt states, batch};
-  \node[block=green!15] (fwd) at (0, 3.3) {FORWARD --- t, addmm, relu, ...};
-  \node[block=yellow!25](sep) at (0, 2.5) {\texttt{\%sep} --- end of forward};
-  \node[block=purple!10](loss)at (0, 1.7) {LOSS --- sum, view, ones\_like};
-  \node[block=yellow!25](sb)  at (0, 0.9) {\texttt{\%sep\_backward} --- start of backward};
-  \node[block=orange!15](bwd) at (0, 0.1) {BACKWARD --- threshold\_backward, mm, ...};
-  \node[block=red!10]   (opt) at (0,-0.7) {OPTIMIZER --- \_foreach\_add, copy\_, ...};
-  \draw[->, thick] (ph)--(fwd); \draw[->, thick] (fwd)--(sep);
-  \draw[->, thick] (sep)--(loss); \draw[->, thick] (loss)--(sb);
-  \draw[->, thick] (sb)--(bwd); \draw[->, thick] (bwd)--(opt);
+\begin{tikzpicture}[every node/.style={font=\small},
+  block/.style={draw, rounded corners, minimum width=7cm, minimum height=0.6cm, fill=#1},
+  arr/.style={->, thick, shorten >=2pt, shorten <=2pt}]
+  \node[block=gray!15]  (ph)  at (0, 0)    {PLACEHOLDER --- params, opt states, batch};
+  \node[block=green!15] (fwd) at (0, -1.0) {FORWARD --- t, addmm, relu, ...};
+  \node[block=yellow!25](sep) at (0, -2.0) {\texttt{\%sep} --- end of forward};
+  \node[block=purple!10](loss)at (0, -3.0) {LOSS --- sum, view, ones\_like};
+  \node[block=yellow!25](sb)  at (0, -4.0) {\texttt{\%sep\_backward} --- start of backward};
+  \node[block=orange!15](bwd) at (0, -5.0) {BACKWARD --- threshold\_backward, mm, ...};
+  \node[block=red!10]   (opt) at (0, -6.0) {OPTIMIZER --- \_foreach\_add, copy\_, ...};
+  \draw[arr] (ph) -- (fwd);
+  \draw[arr] (fwd) -- (sep);
+  \draw[arr] (sep) -- (loss);
+  \draw[arr] (loss) -- (sb);
+  \draw[arr] (sb) -- (bwd);
+  \draw[arr] (bwd) -- (opt);
 \end{tikzpicture}
 \end{center}
 
 `SEPFunction.apply(loss)` inserts the separator nodes during tracing.
 
-## Phase 1 Architecture
-
-\begin{center}
-\begin{tikzpicture}[scale=0.8, every node/.style={font=\small},
-  box/.style={draw, rounded corners, minimum width=3.5cm, minimum height=0.7cm}]
-  \node[box, fill=blue!15] (sa) at (0,0) {Static Analysis};
-  \node[box, fill=green!15] (rp) at (5.5,0) {Runtime Profiling};
-  \node[box, fill=orange!15] (mv) at (11,0) {Memory Viz};
-  \node[anchor=north, font=\footnotesize, text width=3.5cm, align=center] at (0,-0.6)
-    {Boundaries\\Tensor types\\Intermediates\\Lifetimes};
-  \node[anchor=north, font=\footnotesize, text width=3.5cm, align=center] at (5.5,-0.6)
-    {CUDA Events\\Memory deltas\\Swap timing};
-  \node[anchor=north, font=\footnotesize, text width=3.5cm, align=center] at (11,-0.6)
-    {Stacked bar chart\\Peak annotation};
-  \draw[->, thick] (sa) -- (rp);
-  \draw[->, thick] (rp) -- (mv);
-\end{tikzpicture}
-\end{center}
-
-Extends `torch.fx.Interpreter`: override `__init__` (static) and `run_node` (runtime).
-
-## Static Analysis: Boundary Detection
+## Boundary Detection
 
 Scan for separator nodes to partition the graph:
 
@@ -193,9 +175,9 @@ for i, node in enumerate(self.node_list):
 
 Four regions: FORWARD, LOSS, BACKWARD, OPTIMIZER
 
-## Static Analysis: Parameter Identification
+## Parameter Identification
 
-**Challenge:** `fused=True` Adam crashes during FX tracing; `foreach=True` has no single optimizer node; FakeTensors all have `requires_grad=False`.
+**Challenges:** (1) `fused=True` Adam crashes during FX tracing; (2) `foreach=True` has no single optimizer node; and (3) FakeTensors all have `requires_grad=False`.
 
 \vspace{0.3em}
 
@@ -318,9 +300,9 @@ This is **NP-hard** (reduces to knapsack).
 
 \vspace{0.5em}
 
-We use the greedy heuristic from **mu-TWO** (Purandare et al., MLSys 2023).
+We use the greedy heuristic from **$\mu$-TWO** (Purandare et al., MLSys 2023).
 
-## mu-TWO: Background
+## $\mu$-TWO: Background
 
 A compiler for **concurrent multi-model training** on a single GPU.
 

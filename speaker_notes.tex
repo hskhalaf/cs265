@@ -61,9 +61,13 @@
 \qa{What's the difference between FX tracing and torch.compile?}{torch.compile uses Dynamo for tracing, which handles more Python constructs. FX's \texttt{make\_fx} is simpler --- it uses fake tensors to trace through the ops symbolically. The course starter code uses \texttt{make\_fx}, so that's what we build on.}
 
 \slide{The Traced Graph Structure}
-\say{The traced graph has a clear structure. At the top, placeholder nodes represent inputs: parameters, optimizer states, and batch data. Then forward operations, a separator node we insert to mark the boundary, loss computation, another separator for the backward boundary, backward operations, and finally the optimizer step. This structure lets us partition everything into four regions.}
+\say{The traced graph has a clear structure. Placeholder nodes at the top are the inputs: model parameters, optimizer states, and batch data. Then the forward pass operations --- transpose, matmul, relu, etc. Then a separator node, then loss computation, then a second separator, then backward operations, and finally the optimizer step. The key point: this is a \emph{single flat graph} containing the entire training iteration. The two separator nodes are what let us partition it into four regions.}
 
-\qa{What are the separator nodes?}{SEPFunction is an identity function we wrap around the loss. It generates explicit marker nodes in the graph --- a clean boundary that's guaranteed to be there regardless of the loss function used.}
+\say{Each block here is a group of FX nodes. Every individual operation --- each relu, each matrix multiply --- is its own node with explicit inputs and users. That's what makes lifetimes directly readable.}
+
+\qa{What are the separator nodes? Why do we need them?}{Without them, the graph is one continuous stream of ATen operations --- \texttt{sum}, \texttt{mm}, \texttt{copy\_} all look the same. There's no reliable way to tell where forward ends and backward begins. \texttt{SEPFunction} is a custom \texttt{torch.autograd.Function} whose forward calls \texttt{separator.sep(x)} (returns x unchanged) and whose backward calls \texttt{separator.sep\_backward(grad)} (returns grad unchanged). When \texttt{make\_fx} traces through \texttt{loss.backward()}, it records both the forward and backward calls as nodes in the graph. So you get: \texttt{... relu\_9, sum\_1, sep, view, ones\_like, sep\_backward, threshold\_backward ...}. The two marker nodes are no-ops mathematically but are explicit, searchable boundaries in the graph.}
+
+\qa{Could you just search for the first gradient operation instead?}{Not reliably. Some operations like \texttt{view} or \texttt{ones\_like} appear in the loss region between forward and backward, and they look identical to forward ops. The separator gives a guaranteed boundary regardless of loss function or model architecture.}
 
 \slide{Phase 1 Architecture}
 \say{The profiler has three components. Static analysis happens once when created --- walks the graph for boundaries, tensor types, and lifetimes. Runtime profiling measures timing and memory per node during actual execution. The visualizer produces the stacked bar chart.}
