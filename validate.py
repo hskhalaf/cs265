@@ -83,6 +83,40 @@ def _setup_model(name: str):
 
         return model, opt, example_inputs, train_step
 
+    elif name == "Bert":
+        from transformers import BertConfig, BertForSequenceClassification
+        import torch.nn.functional as F
+
+        num_classes = 2
+        seq_len = 128
+        config = BertConfig(
+            vocab_size=30522, hidden_size=768, num_hidden_layers=12,
+            num_attention_heads=12, intermediate_size=3072,
+            max_position_embeddings=512, num_labels=num_classes,
+            torchscript=True,
+        )
+        model = BertForSequenceClassification(config).to(dev)
+
+        input_ids = torch.randint(0, config.vocab_size, (4, seq_len), device=dev)
+        attention_mask = torch.ones(4, seq_len, dtype=torch.long, device=dev)
+        labels = torch.randint(0, num_classes, (4,), device=dev)
+        example_inputs = (input_ids, attention_mask, labels)
+
+        def train_step(model, optim, example_inputs):
+            outputs = model(
+                input_ids=example_inputs[0],
+                attention_mask=example_inputs[1],
+                labels=example_inputs[2],
+            )
+            loss = outputs.loss
+            loss = SEPFunction.apply(loss)
+            loss.backward()
+            optim.step()
+            optim.zero_grad()
+
+        opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
+        return model, opt, example_inputs, train_step
+
     else:
         raise ValueError(f"Unknown model: {name}")
 
@@ -230,6 +264,20 @@ def check_2_ac_decision_sanity(profiler: GraphProfiler, name: str):
         status_d = "PASS" if conv_retained > 0 else "WARN"
         print(f"  [{status_d}] ResNet18: {conv_retained} convolution ops retained "
               f"(expected: expensive ops kept)")
+    elif name == "Bert":
+        # BERT's peak is in the optimizer region — AC cannot help.
+        # The algorithm should retain everything (0 recomputed).
+        baseline = _simulate_peak_memory(profiler, evicted=set())
+        all_evicted = _simulate_peak_memory(profiler, evicted=set(profiler.intermediate_nodes))
+        if all_evicted >= baseline:
+            # Peak is not reducible — correct to retain all.
+            status_d = "PASS" if len(to_recompute) == 0 else "WARN"
+            print(f"  [{status_d}] BERT: peak is in optimizer region "
+                  f"(not reducible by AC), {len(to_recompute)} recomputed "
+                  f"(expected: 0)")
+        else:
+            status_d = "PASS" if len(to_recompute) > 0 else "WARN"
+            print(f"  [{status_d}] BERT: {len(to_recompute)} ops recomputed")
     else:
         status_d = "PASS"
 
@@ -350,7 +398,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1:
         if sys.argv[1] == "--all":
-            models = ["DummyModel", "Resnet18"]
+            models = ["DummyModel", "Resnet18", "Bert"]
         else:
             models = [sys.argv[1]]
 
