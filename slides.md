@@ -198,7 +198,6 @@ if has_fwd_user and has_opt_user:
 
 ## Five Tensor Categories
 
-Matching the course spec --- five categories:
 
 | Category | How identified |
 |----------|---------------|
@@ -225,7 +224,7 @@ For each intermediate:
 - **`first_bwd_access`** = min index among backward users
 - **Lifetime** = `first_bwd` $-$ `last_fwd` (idle period in steps)
 
-Longer lifetime + larger size = better AC candidate.
+Idea: Longer lifetime + larger size = better AC candidate!
 
 ## Runtime Profiling
 
@@ -269,7 +268,7 @@ mem_delta = torch.cuda.memory_allocated() - mem_before
 \end{tikzpicture}
 \end{center}
 
-Green accumulates in forward, freed in backward. Peak = where to apply AC.
+Green accumulates in forward and freed in backward. We should apply AC at the peak.
 
 ## Phase 1 Results: Profiler Accuracy
 
@@ -282,17 +281,13 @@ Green accumulates in forward, freed in backward. Peak = where to apply AC.
 
 \vspace{0.3em}
 
-- DummyModel: CUDA allocator overhead dominates small tensors
-- **ResNet18: 0.97x** --- near-perfect on large feature maps
-- BERT: 1.18x overestimate from optimizer temporaries
-
 # Phase 2: AC Selection Algorithm
 
 ## The Subset Selection Problem
 
 **Input:** $N$ intermediates, each with size $m_i$ and recompute cost $c_i$
 
-**Goal:** choose subset to discard $\Rightarrow$ minimise peak memory, bound extra compute
+**Goal:** choose subset to discard with the goal of minimizing peak memory and bounding extra compute
 
 \vspace{0.5em}
 
@@ -369,17 +364,20 @@ Estimates peak given evicted set:
 If we evict A, and B needs A to be recomputed:
 
 \begin{center}
-\begin{tikzpicture}[scale=0.8, every node/.style={font=\small},
-  box/.style={draw, rounded corners, minimum width=1.8cm, minimum height=0.6cm}]
+\begin{tikzpicture}[every node/.style={font=\small},
+  box/.style={draw, rounded corners, minimum width=2.2cm, minimum height=0.7cm}]
   \node[box, fill=red!15] (a) at (0,0) {A (evicted)};
-  \node[box, fill=green!15] (b) at (5,0) {B};
+  \node[box, fill=green!15] (b) at (5.5,0) {B};
   \draw[->, thick] (a) -- (b) node[midway, above, font=\footnotesize] {recomp\_src};
-  \node[anchor=north, font=\footnotesize, text width=5cm] at (5,-0.5)
-    {B.recomp\_cnt += A.recomp\_cnt\\B.total\_time = B.time $\times$ B.cnt\\B.ratio $\downarrow$ (less attractive to evict)};
+  \node[anchor=north west, font=\footnotesize, text width=7cm] at (0,-0.8)
+    {$\Rightarrow$ B.recomp\_cnt += A.recomp\_cnt \quad
+     $\Rightarrow$ B.total\_time = B.time $\times$ B.cnt \quad
+     $\Rightarrow$ B.ratio $\downarrow$ (less attractive to evict)};
 \end{tikzpicture}
 \end{center}
 
-Prevents cascading chains of expensive recomputations.
+- Evicting A makes recomputing B more expensive (must recompute A first)
+- B's ratio drops $\Rightarrow$ algorithm avoids cascading chains
 
 ## Early Termination: The BERT Finding
 
