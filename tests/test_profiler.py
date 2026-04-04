@@ -512,6 +512,17 @@ class TestACSelection(unittest.TestCase):
         self.assertGreater(len(to_recompute), 0)
 
     @requires_cuda
+    def test_default_budget_retains_some(self):
+        """With default budget (~50% act memory), some should be retained."""
+        to_recompute, to_retain = select_activations_to_recompute(
+            self.profiler,
+        )
+        # Both lists should be non-empty for a model with enough intermediates.
+        if len(self.profiler.intermediate_nodes) > 2:
+            self.assertGreater(len(to_recompute), 0)
+            self.assertGreater(len(to_retain), 0)
+
+    @requires_cuda
     def test_sorted_by_efficiency(self):
         """Recomputed nodes should be ordered by decreasing recompute_ratio."""
         to_recompute, _ = select_activations_to_recompute(self.profiler)

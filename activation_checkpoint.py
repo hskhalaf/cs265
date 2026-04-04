@@ -55,13 +55,19 @@ def select_activations_to_recompute(
     ``recompute_ratio = memory_size / recompute_cost`` (descending) and greedily
     mark them for recomputation until peak memory fits within the budget.
 
+    The algorithm stops as soon as the estimated memory reduction meets the
+    budget.  Remaining intermediates are retained.
+
     Parameters
     ----------
     profiler : GraphProfiler
         A profiler that has been run and had ``aggregate_stats()`` called.
     memory_budget : int, optional
-        Target peak memory in bytes.  If None, all *valid* intermediates are
-        selected for recomputation (maximum memory savings).
+        Target amount of memory to *free* (in bytes).  If None, the budget is
+        set automatically: we aim to remove all activation memory from the
+        peak, i.e. ``budget = peak_memory - (peak_memory - total_act_memory)``.
+        In practice this means we try to halve the activation memory at the
+        peak, keeping a balance between memory savings and recomputation cost.
 
     Returns
     -------
@@ -72,6 +78,18 @@ def select_activations_to_recompute(
     """
     if not profiler.intermediate_nodes:
         return [], []
+
+    # Compute the default budget: reduce peak memory by half the total
+    # activation memory.  This balances memory savings against recomputation
+    # cost — we don't need to evict *everything*, just enough to make a
+    # meaningful difference.
+    if memory_budget is None:
+        total_act_mem = sum(
+            profiler.intermediate_info[n].memory_size
+            for n in profiler.intermediate_nodes
+        )
+        # Target: free half the activation memory from the peak.
+        memory_budget = total_act_mem // 2
 
     # Gather candidates with their profiling data.
     candidates = []
@@ -92,13 +110,14 @@ def select_activations_to_recompute(
     # Sort by recompute_ratio descending (best bang for buck first).
     candidates.sort(key=lambda c: c["recompute_ratio"], reverse=True)
 
-    # Greedily select candidates for recomputation.
+    # Greedily select candidates for recomputation, stopping once the
+    # memory budget is met.
     to_recompute: List[fx.Node] = []
     to_retain: List[fx.Node] = []
     memory_saved = 0
 
     for cand in candidates:
-        if memory_budget is not None and memory_saved >= memory_budget:
+        if memory_saved >= memory_budget:
             to_retain.append(cand["node"])
             continue
         to_recompute.append(cand["node"])
