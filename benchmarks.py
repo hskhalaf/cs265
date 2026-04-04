@@ -40,7 +40,7 @@ model_names: List[str] = [
 model_batch_sizes: Dict[str, int] = {
     "Transformer": 4,
     "Resnet18": 16,
-    "Resnet50": 4,
+    "Resnet50": 16,
     "Bert": 4,
 }
 
