@@ -207,19 +207,23 @@ class GraphProfiler(fx.Interpreter):
         # ------------------------------------------------------------------
         # 2. Locate the optimizer node and extract parameter / gradient sets.
         #
-        # Strategy A (fused=True): The _fused_adam node's arguments are:
+        # Strategy A (fused=True): a single _fused_adam node exists.
         #   args[0] = list of parameter nodes
         #   args[1] = list of gradient nodes
         #
-        # Strategy B (foreach=True): No single optimizer node exists.  The
-        # optimizer step is decomposed into many _foreach_* ops.  We identify
-        # parameters by checking which placeholder nodes have requires_grad
-        # set in their FakeTensor metadata.
+        # Strategy B (foreach=True): no single optimizer node.  The step
+        # is decomposed into many _foreach_* / copy_ ops.  We identify
+        # the optimizer region boundary as the first _foreach_* op after
+        # sep_backward, then identify parameters as placeholder nodes that
+        # have users in BOTH the forward region and the optimizer region.
+        # (Batch data is used in forward+backward but NOT optimizer;
+        # optimizer states are used only in the optimizer region.)
         # ------------------------------------------------------------------
 
         self.optimizer_node: Optional[fx.Node] = None
         self.optimizer_index: int = -1
 
+        # Try Strategy A first.
         for i, node in enumerate(self.node_list):
             if (
                 node.op == OP.CALL_FUNCTION
@@ -229,6 +233,18 @@ class GraphProfiler(fx.Interpreter):
                 self.optimizer_index = i
                 break
 
+        # If no _fused_adam, detect optimizer boundary from _foreach_* ops.
+        if self.optimizer_index < 0:
+            for i, node in enumerate(self.node_list):
+                if i <= self.sep_bwd_index:
+                    continue
+                if (
+                    node.op == OP.CALL_FUNCTION
+                    and "_foreach" in str(node.target)
+                ):
+                    self.optimizer_index = i
+                    break
+
         self.param_nodes: Set[fx.Node] = set()
         self.grad_nodes: Set[fx.Node] = set()
 
@@ -236,47 +252,22 @@ class GraphProfiler(fx.Interpreter):
             # Strategy A: read directly from _fused_adam args.
             self.param_nodes = set(self.optimizer_node.args[0])
             self.grad_nodes = set(self.optimizer_node.args[1])
-        else:
-            # Strategy B: identify params from FakeTensor metadata.
-            # Parameters are placeholder nodes whose traced FakeTensor has
-            # requires_grad=True.  Optimizer states and batch data do not.
+        elif self.optimizer_index >= 0:
+            # Strategy B: parameters are placeholder nodes that have users
+            # in BOTH the forward region (before sep) and the optimizer
+            # region (at or after optimizer_index).
             for node in self.node_list:
                 if node.op != OP.PLACEHOLDER:
                     continue
-                val = node.meta.get("val", None)
-                if val is None:
-                    continue
-                if isinstance(val, torch.Tensor) and val.requires_grad:
+                user_indices = [
+                    self.node_to_idx[u]
+                    for u in node.users
+                    if u in self.node_to_idx
+                ]
+                has_fwd_user = any(idx < self.sep_index for idx in user_indices)
+                has_opt_user = any(idx >= self.optimizer_index for idx in user_indices)
+                if has_fwd_user and has_opt_user:
                     self.param_nodes.add(node)
-
-            # Identify the optimizer region boundary: the first copy_ node
-            # after the backward pass that targets a parameter is the start
-            # of the optimizer step.
-            for i, node in enumerate(self.node_list):
-                if i <= self.sep_bwd_index:
-                    continue
-                if (
-                    node.op == OP.CALL_FUNCTION
-                    and hasattr(node.target, "__name__")
-                    and "copy_" in str(node.target)
-                    and any(inp in self.param_nodes for inp in node.all_input_nodes)
-                ):
-                    self.optimizer_index = i
-                    break
-
-            # If we still didn't find the optimizer boundary, fall back to
-            # placing it after all backward nodes.  We detect the first
-            # _foreach_* op after sep_backward as the optimizer start.
-            if self.optimizer_index < 0:
-                for i, node in enumerate(self.node_list):
-                    if i <= self.sep_bwd_index:
-                        continue
-                    if (
-                        node.op == OP.CALL_FUNCTION
-                        and "_foreach" in str(node.target)
-                    ):
-                        self.optimizer_index = i
-                        break
 
         # ------------------------------------------------------------------
         # 3. Classify every node's region.
