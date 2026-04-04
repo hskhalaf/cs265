@@ -18,12 +18,13 @@ from graph_prof import GraphProfiler, NodeType, Region
 
 # Colours and display order (bottom to top).
 _ROLE_STYLE = {
-    NodeType.PARAM: {"color": "#4C72B0", "label": "Parameter"},
-    NodeType.ACT:   {"color": "#55A868", "label": "Activation"},
-    NodeType.GRAD:  {"color": "#DD8452", "label": "Gradient"},
-    NodeType.OTHER: {"color": "#8172B3", "label": "Other"},
+    NodeType.PARAM:          {"color": "#4C72B0", "label": "Parameter"},
+    NodeType.ACT:            {"color": "#55A868", "label": "Activation"},
+    NodeType.GRAD:           {"color": "#DD8452", "label": "Gradient"},
+    NodeType.OPTIMIZER_STATE: {"color": "#C44E52", "label": "Optimizer State"},
+    NodeType.OTHER:          {"color": "#8172B3", "label": "Other"},
 }
-_ROLE_ORDER = [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OTHER]
+_ROLE_ORDER = [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPTIMIZER_STATE, NodeType.OTHER]
 
 
 class MemoryVisualizer:

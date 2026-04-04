@@ -51,11 +51,16 @@ class OP(str, Enum):
 
 
 class NodeType(Enum):
-    """Classification of tensors in the graph."""
+    """Classification of tensors in the graph.
+
+    Matches the five categories from the course spec: parameter, gradient,
+    activation, optimizer state, or other.
+    """
     PARAM = 0
     ACT = 1
     GRAD = 2
-    OTHER = 3
+    OPTIMIZER_STATE = 3
+    OTHER = 4
 
 
 class Region(Enum):
@@ -288,7 +293,35 @@ class GraphProfiler(fx.Interpreter):
 
         # ------------------------------------------------------------------
         # 4. Classify every node's tensor type.
+        #
+        # Five categories (matching the course spec):
+        #   PARAM          — model weights, used in forward + optimizer
+        #   GRAD           — gradient tensors (identifiable with fused=True)
+        #   ACT            — intermediate activations (set in step 5 below)
+        #   OPTIMIZER_STATE — Adam's exp_avg, exp_avg_sq, step counters;
+        #                     placeholder nodes used only in the optimizer region
+        #   OTHER          — batch data, loss, backward intermediates, etc.
         # ------------------------------------------------------------------
+
+        # Identify optimizer state placeholders: placeholder nodes whose users
+        # are exclusively in the optimizer region (not forward, not backward).
+        self.optimizer_state_nodes: Set[fx.Node] = set()
+        if self.optimizer_index >= 0:
+            for node in self.node_list:
+                if node.op != OP.PLACEHOLDER:
+                    continue
+                if node in self.param_nodes or node in self.grad_nodes:
+                    continue
+                user_indices = [
+                    self.node_to_idx[u]
+                    for u in node.users
+                    if u in self.node_to_idx
+                ]
+                if not user_indices:
+                    continue
+                all_in_opt = all(idx >= self.optimizer_index for idx in user_indices)
+                if all_in_opt:
+                    self.optimizer_state_nodes.add(node)
 
         self.node_types: Dict[fx.Node, NodeType] = {}
         for node in self.node_list:
@@ -296,6 +329,8 @@ class GraphProfiler(fx.Interpreter):
                 self.node_types[node] = NodeType.PARAM
             elif node in self.grad_nodes:
                 self.node_types[node] = NodeType.GRAD
+            elif node in self.optimizer_state_nodes:
+                self.node_types[node] = NodeType.OPTIMIZER_STATE
             else:
                 # Default; intermediates are re-classified below.
                 self.node_types[node] = NodeType.OTHER
@@ -587,7 +622,7 @@ class GraphProfiler(fx.Interpreter):
                 + self.node_sizes.get(node.name, 0)
             )
 
-        for ntype in [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OTHER]:
+        for ntype in [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPTIMIZER_STATE, NodeType.OTHER]:
             count = role_counts.get(ntype, 0)
             nbytes = role_bytes.get(ntype, 0)
             print(

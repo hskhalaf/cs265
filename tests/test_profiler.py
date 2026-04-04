@@ -492,10 +492,10 @@ class TestACSelection(unittest.TestCase):
                 )
 
     @requires_cuda
-    def test_with_memory_budget_zero(self):
-        """With budget=0, nothing should be recomputed."""
+    def test_with_mem_limit_very_high(self):
+        """With mem_limit higher than current peak, nothing is recomputed."""
         to_recompute, to_retain = select_activations_to_recompute(
-            self.profiler, memory_budget=0,
+            self.profiler, mem_limit=10**12,
         )
         self.assertEqual(len(to_recompute), 0)
         self.assertEqual(
@@ -503,10 +503,10 @@ class TestACSelection(unittest.TestCase):
         )
 
     @requires_cuda
-    def test_with_large_budget(self):
-        """With a very large budget, all valid intermediates are recomputed."""
+    def test_with_mem_limit_zero(self):
+        """With mem_limit=0, as much as possible should be recomputed."""
         to_recompute, to_retain = select_activations_to_recompute(
-            self.profiler, memory_budget=10**12,
+            self.profiler, mem_limit=0,
         )
         # At least some should be recomputed.
         self.assertGreater(len(to_recompute), 0)
