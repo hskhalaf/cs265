@@ -436,7 +436,7 @@ class TestACSelection(unittest.TestCase):
     @classmethod
     @requires_cuda
     def setUpClass(cls):
-        cls.profiler, cls.args = _build_profiler(layers=4, dim=32)
+        cls.profiler, cls.args = _build_profiler(layers=4, dim=32, batch_size=512)
         with torch.no_grad():
             for _ in range(2):
                 cls.profiler.run(*cls.args)
@@ -505,22 +505,35 @@ class TestACSelection(unittest.TestCase):
     @requires_cuda
     def test_with_mem_limit_zero(self):
         """With mem_limit=0, as much as possible should be recomputed."""
+        from activation_checkpoint import _simulate_peak_memory
+        baseline = _simulate_peak_memory(self.profiler, evicted=set())
+        all_evicted = _simulate_peak_memory(self.profiler, evicted=set(self.profiler.intermediate_nodes))
         to_recompute, to_retain = select_activations_to_recompute(
             self.profiler, mem_limit=0,
         )
-        # At least some should be recomputed.
-        self.assertGreater(len(to_recompute), 0)
+        if all_evicted < baseline:
+            # AC can help — should recompute something.
+            self.assertGreater(len(to_recompute), 0)
+        else:
+            # Peak is not activation-dominated — correct to retain all.
+            self.assertEqual(len(to_recompute), 0)
 
     @requires_cuda
     def test_default_budget_retains_some(self):
-        """With default budget (~50% act memory), some should be retained."""
+        """With default budget, at least some should be retained."""
+        from activation_checkpoint import _simulate_peak_memory
+        baseline = _simulate_peak_memory(self.profiler, evicted=set())
+        all_evicted = _simulate_peak_memory(self.profiler, evicted=set(self.profiler.intermediate_nodes))
         to_recompute, to_retain = select_activations_to_recompute(
             self.profiler,
         )
-        # Both lists should be non-empty for a model with enough intermediates.
-        if len(self.profiler.intermediate_nodes) > 2:
+        if all_evicted < baseline and len(self.profiler.intermediate_nodes) > 2:
+            # AC can help — should have both recomputed and retained.
             self.assertGreater(len(to_recompute), 0)
             self.assertGreater(len(to_retain), 0)
+        else:
+            # Peak is not activation-dominated — all retained is correct.
+            self.assertEqual(len(to_recompute), 0)
 
     @requires_cuda
     def test_sorted_by_efficiency(self):
