@@ -1,30 +1,9 @@
 """
-Graph Profiler for CS265 Activation Checkpointing Project.
+FX Graph Profiler — static analysis + runtime profiling for activation checkpointing.
 
-This module implements a profiler that extends torch.fx.Interpreter to execute
-an FX graph node-by-node, collecting per-node timing and memory measurements,
-classifying tensors by role, and computing activation lifetimes.
-
-The FX graph is produced by graph_tracer.compile(), which traces a full training
-step (forward + backward + optimizer) into a single graph.  The graph contains
-explicit separator nodes (%sep, %sep_backward) that mark the boundary between
-the forward pass, loss computation, and backward pass.
-
-Architecture
-------------
-The profiler performs two kinds of analysis:
-
-1. **Static analysis** (in __init__): walks the graph once to identify forward/
-   backward boundaries, classify nodes into five types (PARAM, ACT, GRAD,
-   OPTIMIZER_STATE, OTHER), identify intermediate activations, and compute
-   their lifetimes (last forward use, first backward use).
-
-2. **Runtime profiling** (in run_node): executes each node while measuring
-   wall-clock time via torch.cuda.Event and GPU memory delta via
-   torch.cuda.memory_allocated().  Intermediate activations are swapped to CPU
-   after their last forward use and swapped back before their first backward
-   use, both to measure swap overhead and to keep GPU memory manageable during
-   profiling.
+Extends torch.fx.Interpreter to execute a traced FX graph node-by-node,
+classifying tensors (PARAM, ACT, GRAD, OPTIMIZER_STATE, OTHER), computing
+activation lifetimes, and measuring per-node timing and memory.
 """
 
 from enum import Enum
@@ -35,13 +14,7 @@ import torch
 import torch.fx as fx
 
 
-# ---------------------------------------------------------------------------
-# Enums and data structures
-# ---------------------------------------------------------------------------
-
-
 class OP(str, Enum):
-    """FX node operation types."""
     CALL_FUNCTION = "call_function"
     CALL_MODULE = "call_module"
     CALL_METHOD = "call_method"
@@ -51,11 +24,6 @@ class OP(str, Enum):
 
 
 class NodeType(Enum):
-    """Classification of tensors in the graph.
-
-    Matches the five categories from the course spec: parameter, gradient,
-    activation, optimizer state, or other.
-    """
     PARAM = 0
     ACT = 1
     GRAD = 2
@@ -64,7 +32,6 @@ class NodeType(Enum):
 
 
 class Region(Enum):
-    """Which part of the training step a node belongs to."""
     FORWARD = 0
     LOSS = 1
     BACKWARD = 2
@@ -74,29 +41,6 @@ class Region(Enum):
 
 @dataclass
 class IntermediateInfo:
-    """Profiling data for a single intermediate activation (feature map).
-
-    Attributes
-    ----------
-    node : fx.Node
-        The FX graph node that produces this activation.
-    memory_size : int
-        Size in bytes, computed from FakeTensor metadata.
-    last_fwd_access : int
-        Index (in node_list) of the last forward-region user of this node.
-    first_bwd_access : int
-        Index (in node_list) of the first backward-region user of this node.
-    inactive_time_ms : float
-        Wall-clock time between last forward use and first backward use,
-        measured during profiling (averaged over measurement iterations).
-    recompute_cost_ms : float
-        Wall-clock time to execute this node, measured during profiling
-        (averaged over measurement iterations).
-    swap_out_time_ms : float
-        Time to transfer this tensor from GPU to CPU.
-    swap_in_time_ms : float
-        Time to transfer this tensor from CPU back to GPU.
-    """
     node: fx.Node
     memory_size: int = 0
     last_fwd_access: int = -1
@@ -107,86 +51,24 @@ class IntermediateInfo:
     swap_in_time_ms: float = 0.0
 
 
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-
 def _tensor_size_bytes(val: Any) -> int:
-    """Return the size in bytes of a tensor or tuple of tensors.
-
-    Parameters
-    ----------
-    val : Any
-        The value from ``node.meta['val']``, which is a FakeTensor (or a tuple
-        of FakeTensors) when the graph was traced with ``make_fx`` in fake mode.
-
-    Returns
-    -------
-    int
-        Total bytes.  Returns 0 for non-tensor values.
-    """
+    """Size in bytes of a tensor or tuple of tensors. Returns 0 for non-tensors."""
     if isinstance(val, torch.Tensor):
         return val.numel() * val.element_size()
     if isinstance(val, (tuple, list)):
-        return sum(
-            v.numel() * v.element_size()
-            for v in val
-            if isinstance(v, torch.Tensor)
-        )
+        return sum(v.numel() * v.element_size() for v in val if isinstance(v, torch.Tensor))
     return 0
 
 
-# ---------------------------------------------------------------------------
-# GraphProfiler
-# ---------------------------------------------------------------------------
-
-
 class GraphProfiler(fx.Interpreter):
-    """Node-by-node graph executor that collects profiling statistics.
 
-    The profiler is designed to be used in two phases:
-
-    1. **Warm-up** — run a few iterations to stabilise CUDA caches and JIT.
-    2. **Measurement** — reset stats, run several iterations, then aggregate.
-
-    Example
-    -------
-    >>> profiler = GraphProfiler(gm)
-    >>> with torch.no_grad():
-    ...     for _ in range(warm_up):
-    ...         profiler.run(*args)
-    ...     profiler.reset_stats()
-    ...     for _ in range(measure):
-    ...         profiler.run(*args)
-    >>> profiler.aggregate_stats()
-    >>> profiler.print_stats()
-    """
-
-    # ------------------------------------------------------------------ init
-
-    def __init__(
-        self,
-        module: fx.GraphModule,
-        garbage_collect_values: bool = True,
-    ):
+    def __init__(self, module: fx.GraphModule, garbage_collect_values: bool = True):
         super().__init__(module, garbage_collect_values)
 
-        # Ordered list of all nodes and fast index lookup.
         self.node_list: List[fx.Node] = list(self.module.graph.nodes)
-        self.node_to_idx: Dict[fx.Node, int] = {
-            n: i for i, n in enumerate(self.node_list)
-        }
+        self.node_to_idx: Dict[fx.Node, int] = {n: i for i, n in enumerate(self.node_list)}
 
-        # ------------------------------------------------------------------
-        # 1. Locate separator nodes (forward / backward boundaries).
-        #
-        # The graph_tracer inserts two identity operations:
-        #   %sep            — marks the end of the forward pass
-        #   %sep_backward   — marks the start of the backward pass
-        # Everything between them is the loss computation.
-        # ------------------------------------------------------------------
-
+        # 1. Find separator nodes (%sep, %sep_backward) that mark forward/backward boundaries.
         self.sep_node: Optional[fx.Node] = None
         self.sep_bwd_node: Optional[fx.Node] = None
         self.sep_index: int = -1
@@ -201,52 +83,27 @@ class GraphProfiler(fx.Interpreter):
                     self.sep_bwd_node = node
                     self.sep_bwd_index = i
 
-        assert self.sep_node is not None, (
-            "Could not find separator.sep node — did you wrap the loss with "
-            "SEPFunction.apply()?"
-        )
-        assert self.sep_bwd_node is not None, (
-            "Could not find separator.sep_backward node."
-        )
+        assert self.sep_node is not None, "Could not find %sep node"
+        assert self.sep_bwd_node is not None, "Could not find %sep_backward node"
 
-        # ------------------------------------------------------------------
-        # 2. Locate the optimizer node and extract parameter / gradient sets.
-        #
-        # Strategy A (fused=True): a single _fused_adam node exists.
-        #   args[0] = list of parameter nodes
-        #   args[1] = list of gradient nodes
-        #
-        # Strategy B (foreach=True): no single optimizer node.  The step
-        # is decomposed into many _foreach_* / copy_ ops.  We identify
-        # the optimizer region boundary as the first _foreach_* op after
-        # sep_backward, then identify parameters as placeholder nodes that
-        # have users in BOTH the forward region and the optimizer region.
-        # (Batch data is used in forward+backward but NOT optimizer;
-        # optimizer states are used only in the optimizer region.)
-        # ------------------------------------------------------------------
-
+        # 2. Find optimizer boundary and identify parameters/gradients.
+        #    Strategy A: _fused_adam node (fused=True) — read params/grads from args.
+        #    Strategy B: _foreach_* ops (foreach=True) — params = placeholders with
+        #                users in both forward and optimizer regions.
         self.optimizer_node: Optional[fx.Node] = None
         self.optimizer_index: int = -1
 
-        # Try Strategy A first.
         for i, node in enumerate(self.node_list):
-            if (
-                node.op == OP.CALL_FUNCTION
-                and node.target == torch.ops.aten._fused_adam.default
-            ):
+            if node.op == OP.CALL_FUNCTION and node.target == torch.ops.aten._fused_adam.default:
                 self.optimizer_node = node
                 self.optimizer_index = i
                 break
 
-        # If no _fused_adam, detect optimizer boundary from _foreach_* ops.
         if self.optimizer_index < 0:
             for i, node in enumerate(self.node_list):
                 if i <= self.sep_bwd_index:
                     continue
-                if (
-                    node.op == OP.CALL_FUNCTION
-                    and "_foreach" in str(node.target)
-                ):
+                if node.op == OP.CALL_FUNCTION and "_foreach" in str(node.target):
                     self.optimizer_index = i
                     break
 
@@ -254,30 +111,19 @@ class GraphProfiler(fx.Interpreter):
         self.grad_nodes: Set[fx.Node] = set()
 
         if self.optimizer_node is not None:
-            # Strategy A: read directly from _fused_adam args.
             self.param_nodes = set(self.optimizer_node.args[0])
             self.grad_nodes = set(self.optimizer_node.args[1])
         elif self.optimizer_index >= 0:
-            # Strategy B: parameters are placeholder nodes that have users
-            # in BOTH the forward region (before sep) and the optimizer
-            # region (at or after optimizer_index).
             for node in self.node_list:
                 if node.op != OP.PLACEHOLDER:
                     continue
-                user_indices = [
-                    self.node_to_idx[u]
-                    for u in node.users
-                    if u in self.node_to_idx
-                ]
-                has_fwd_user = any(idx < self.sep_index for idx in user_indices)
-                has_opt_user = any(idx >= self.optimizer_index for idx in user_indices)
-                if has_fwd_user and has_opt_user:
+                user_indices = [self.node_to_idx[u] for u in node.users if u in self.node_to_idx]
+                has_fwd = any(idx < self.sep_index for idx in user_indices)
+                has_opt = any(idx >= self.optimizer_index for idx in user_indices)
+                if has_fwd and has_opt:
                     self.param_nodes.add(node)
 
-        # ------------------------------------------------------------------
-        # 3. Classify every node's region.
-        # ------------------------------------------------------------------
-
+        # 3. Assign each node a region.
         self.node_region: Dict[fx.Node, Region] = {}
         for i, node in enumerate(self.node_list):
             if self.optimizer_index >= 0 and i >= self.optimizer_index:
@@ -291,36 +137,14 @@ class GraphProfiler(fx.Interpreter):
             else:
                 self.node_region[node] = Region.OTHER
 
-        # ------------------------------------------------------------------
-        # 4. Classify every node's tensor type.
-        #
-        # Five categories (matching the course spec):
-        #   PARAM          — model weights, used in forward + optimizer
-        #   GRAD           — gradient tensors (identifiable with fused=True)
-        #   ACT            — intermediate activations (set in step 5 below)
-        #   OPTIMIZER_STATE — Adam's exp_avg, exp_avg_sq, step counters;
-        #                     placeholder nodes used only in the optimizer region
-        #   OTHER          — batch data, loss, backward intermediates, etc.
-        # ------------------------------------------------------------------
-
-        # Identify optimizer state placeholders: placeholder nodes whose users
-        # are exclusively in the optimizer region (not forward, not backward).
+        # 4. Classify each node's tensor type.
         self.optimizer_state_nodes: Set[fx.Node] = set()
         if self.optimizer_index >= 0:
             for node in self.node_list:
-                if node.op != OP.PLACEHOLDER:
+                if node.op != OP.PLACEHOLDER or node in self.param_nodes or node in self.grad_nodes:
                     continue
-                if node in self.param_nodes or node in self.grad_nodes:
-                    continue
-                user_indices = [
-                    self.node_to_idx[u]
-                    for u in node.users
-                    if u in self.node_to_idx
-                ]
-                if not user_indices:
-                    continue
-                all_in_opt = all(idx >= self.optimizer_index for idx in user_indices)
-                if all_in_opt:
+                user_indices = [self.node_to_idx[u] for u in node.users if u in self.node_to_idx]
+                if user_indices and all(idx >= self.optimizer_index for idx in user_indices):
                     self.optimizer_state_nodes.add(node)
 
         self.node_types: Dict[fx.Node, NodeType] = {}
@@ -332,184 +156,93 @@ class GraphProfiler(fx.Interpreter):
             elif node in self.optimizer_state_nodes:
                 self.node_types[node] = NodeType.OPTIMIZER_STATE
             else:
-                # Default; intermediates are re-classified below.
                 self.node_types[node] = NodeType.OTHER
 
-        # ------------------------------------------------------------------
-        # 5. Identify intermediate activations.
-        #
-        # An intermediate activation is a call_function node created during
-        # the forward pass that has at least one user in the backward pass.
-        # These are the tensors whose memory can be reclaimed by activation
-        # checkpointing.
-        # ------------------------------------------------------------------
-
+        # 5. Identify intermediate activations: forward call_function nodes with backward users.
         self.intermediate_nodes: List[fx.Node] = []
         self.intermediate_info: Dict[fx.Node, IntermediateInfo] = {}
 
         for node in self.node_list:
             idx = self.node_to_idx[node]
-
-            # Must be in the forward region and be a computation node.
-            if idx >= self.sep_index:
+            if idx >= self.sep_index or node.op != OP.CALL_FUNCTION or node in self.param_nodes:
                 continue
-            if node.op != OP.CALL_FUNCTION:
-                continue
-            if node in self.param_nodes:
+            if not any(self.node_to_idx.get(u, -1) >= self.sep_bwd_index for u in node.users):
                 continue
 
-            # Must have at least one user in the backward region.
-            has_bwd_user = any(
-                self.node_to_idx.get(u, -1) >= self.sep_bwd_index
-                for u in node.users
-            )
-            if not has_bwd_user:
-                continue
-
-            # Compute lifetime endpoints.
-            fwd_user_indices = [
-                self.node_to_idx[u]
-                for u in node.users
-                if self.node_to_idx.get(u, -1) <= self.sep_index
-            ]
-            bwd_user_indices = [
-                self.node_to_idx[u]
-                for u in node.users
-                if self.node_to_idx.get(u, -1) >= self.sep_bwd_index
-            ]
-
-            last_fwd = max(fwd_user_indices) if fwd_user_indices else idx
-            first_bwd = min(bwd_user_indices) if bwd_user_indices else -1
-
-            # Tensor size from FakeTensor metadata.
-            mem_size = _tensor_size_bytes(node.meta.get("val", None))
+            fwd_users = [self.node_to_idx[u] for u in node.users if self.node_to_idx.get(u, -1) <= self.sep_index]
+            bwd_users = [self.node_to_idx[u] for u in node.users if self.node_to_idx.get(u, -1) >= self.sep_bwd_index]
 
             info = IntermediateInfo(
                 node=node,
-                memory_size=mem_size,
-                last_fwd_access=last_fwd,
-                first_bwd_access=first_bwd,
+                memory_size=_tensor_size_bytes(node.meta.get("val", None)),
+                last_fwd_access=max(fwd_users) if fwd_users else idx,
+                first_bwd_access=min(bwd_users) if bwd_users else -1,
             )
-
             self.intermediate_nodes.append(node)
             self.intermediate_info[node] = info
             self.node_types[node] = NodeType.ACT
 
-        # Build swap schedule lookup tables.
-        self._intermediate_name_to_node: Dict[str, fx.Node] = {
-            n.name: n for n in self.intermediate_nodes
-        }
+        # Build swap schedule: at each step, which intermediates to swap out/in.
+        self._intermediate_name_to_node: Dict[str, fx.Node] = {n.name: n for n in self.intermediate_nodes}
 
-        # At step i, which intermediates should be swapped *out*?
         self._swap_out_at: Dict[int, List[str]] = {}
         for info in self.intermediate_info.values():
-            self._swap_out_at.setdefault(
-                info.last_fwd_access, []
-            ).append(info.node.name)
+            self._swap_out_at.setdefault(info.last_fwd_access, []).append(info.node.name)
 
-        # At step i, which intermediates need to be swapped *in*?
         self._swap_in_at: Dict[int, List[str]] = {}
         for info in self.intermediate_info.values():
             if info.first_bwd_access >= 0:
-                self._swap_in_at.setdefault(
-                    info.first_bwd_access, []
-                ).append(info.node.name)
+                self._swap_in_at.setdefault(info.first_bwd_access, []).append(info.node.name)
 
-        # ------------------------------------------------------------------
-        # 6. Compute node sizes for all nodes (used by the memory chart).
-        # ------------------------------------------------------------------
-
+        # 6. Node sizes for memory chart.
         self.node_sizes: Dict[str, int] = {}
         for node in self.node_list:
-            self.node_sizes[node.name] = _tensor_size_bytes(
-                node.meta.get("val", None)
-            )
+            self.node_sizes[node.name] = _tensor_size_bytes(node.meta.get("val", None))
 
-        # ------------------------------------------------------------------
         # 7. Runtime profiling accumulators.
-        # ------------------------------------------------------------------
-
         self._node_runtimes: Dict[str, List[float]] = {}
         self._node_mem_deltas: Dict[str, List[int]] = {}
         self._swap_out_times: Dict[str, List[float]] = {}
         self._swap_in_times: Dict[str, List[float]] = {}
-
-        # Averaged stats (populated by aggregate_stats).
         self.avg_runtimes: Dict[str, float] = {}
         self.avg_mem_deltas: Dict[str, float] = {}
         self.avg_swap_out: Dict[str, float] = {}
         self.avg_swap_in: Dict[str, float] = {}
-
-        # CPU-side storage for swapped-out tensors during a single run.
         self._cpu_store: Dict[str, torch.Tensor] = {}
 
-    # ------------------------------------------------------------------ run
-
-    def run(
-        self,
-        *args,
-        initial_env: Optional[Dict[fx.Node, Any]] = None,
-        enable_io_processing: bool = True,
-    ) -> Any:
+    def run(self, *args, initial_env: Optional[Dict[fx.Node, Any]] = None, enable_io_processing: bool = True) -> Any:
         self._cpu_store.clear()
-        return super().run(
-            *args,
-            initial_env=initial_env,
-            enable_io_processing=enable_io_processing,
-        )
-
-    # -------------------------------------------------------------- run_node
+        return super().run(*args, initial_env=initial_env, enable_io_processing=enable_io_processing)
 
     def run_node(self, n: fx.Node) -> Any:
         idx = self.node_to_idx[n]
 
-        # --- Swap-in -------------------------------------------------------
-        # If we are in the backward region and this step is the first backward
-        # user of some intermediate, move it back from CPU to GPU so that the
-        # node can consume it.
-
+        # Swap-in: bring intermediates back from CPU before their first backward use.
         for name in self._swap_in_at.get(idx, []):
             if name not in self._cpu_store:
                 continue
             cpu_tensor = self._cpu_store.pop(name)
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record()
             gpu_tensor = cpu_tensor.cuda()
             end.record()
             torch.cuda.synchronize()
-
-            self._swap_in_times.setdefault(name, []).append(
-                start.elapsed_time(end)
-            )
-
-            # Write the tensor back into the interpreter's environment.
+            self._swap_in_times.setdefault(name, []).append(start.elapsed_time(end))
             source_node = self._intermediate_name_to_node.get(name)
             if source_node is not None:
                 self.env[source_node] = gpu_tensor
 
-        # --- Execute the node and measure timing + memory ------------------
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
+        # Execute the node with timing + memory measurement.
+        start_event, end_event = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         mem_before = torch.cuda.memory_allocated()
-
         start_event.record()
         result = super().run_node(n)
         end_event.record()
         torch.cuda.synchronize()
+        self._node_runtimes.setdefault(n.name, []).append(start_event.elapsed_time(end_event))
+        self._node_mem_deltas.setdefault(n.name, []).append(torch.cuda.memory_allocated() - mem_before)
 
-        elapsed_ms = start_event.elapsed_time(end_event)
-        mem_delta = torch.cuda.memory_allocated() - mem_before
-
-        self._node_runtimes.setdefault(n.name, []).append(elapsed_ms)
-        self._node_mem_deltas.setdefault(n.name, []).append(mem_delta)
-
-        # --- Swap-out ------------------------------------------------------
-        # If this step is the last forward user of some intermediate, move it
-        # to CPU to free GPU memory.
-
+        # Swap-out: move intermediates to CPU after their last forward use.
         for name in self._swap_out_at.get(idx, []):
             source_node = self._intermediate_name_to_node.get(name)
             if source_node is None or source_node not in self.env:
@@ -517,25 +250,18 @@ class GraphProfiler(fx.Interpreter):
             gpu_tensor = self.env[source_node]
             if not isinstance(gpu_tensor, torch.Tensor) or not gpu_tensor.is_cuda:
                 continue
-
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record()
             cpu_tensor = gpu_tensor.cpu()
             end.record()
             torch.cuda.synchronize()
-
-            self._swap_out_times.setdefault(name, []).append(
-                start.elapsed_time(end)
-            )
+            self._swap_out_times.setdefault(name, []).append(start.elapsed_time(end))
             self._cpu_store[name] = cpu_tensor
 
         return result
 
-    # -------------------------------------------------------- aggregate_stats
-
     def aggregate_stats(self) -> None:
-        """Average runtime and memory measurements over all recorded runs."""
+        """Average measurements over all recorded runs and populate IntermediateInfo."""
         for name, runs in self._node_runtimes.items():
             self.avg_runtimes[name] = sum(runs) / len(runs) if runs else 0.0
         for name, mems in self._node_mem_deltas.items():
@@ -545,27 +271,17 @@ class GraphProfiler(fx.Interpreter):
         for name, times in self._swap_in_times.items():
             self.avg_swap_in[name] = sum(times) / len(times) if times else 0.0
 
-        # Populate IntermediateInfo with averaged measurements.
         for node, info in self.intermediate_info.items():
-            name = node.name
-            info.recompute_cost_ms = self.avg_runtimes.get(name, 0.0)
-            info.swap_out_time_ms = self.avg_swap_out.get(name, 0.0)
-            info.swap_in_time_ms = self.avg_swap_in.get(name, 0.0)
-
-            # Inactive time = wall-clock time between last forward use and
-            # first backward use, approximated as the sum of node runtimes
-            # over the interval (last_fwd_access, first_bwd_access).
-            inactive_ms = 0.0
-            for i in range(info.last_fwd_access + 1, info.first_bwd_access):
-                step_name = self.node_list[i].name
-                inactive_ms += self.avg_runtimes.get(step_name, 0.0)
-            info.inactive_time_ms = inactive_ms
-
-    # ---------------------------------------------------------- reset_stats
+            info.recompute_cost_ms = self.avg_runtimes.get(node.name, 0.0)
+            info.swap_out_time_ms = self.avg_swap_out.get(node.name, 0.0)
+            info.swap_in_time_ms = self.avg_swap_in.get(node.name, 0.0)
+            info.inactive_time_ms = sum(
+                self.avg_runtimes.get(self.node_list[i].name, 0.0)
+                for i in range(info.last_fwd_access + 1, info.first_bwd_access)
+            )
 
     def reset_stats(self) -> None:
-        """Clear all accumulated measurements (call between warm-up and
-        measurement phases)."""
+        """Clear all accumulated measurements."""
         self._node_runtimes.clear()
         self._node_mem_deltas.clear()
         self._swap_out_times.clear()
@@ -575,186 +291,93 @@ class GraphProfiler(fx.Interpreter):
         self.avg_swap_out.clear()
         self.avg_swap_in.clear()
 
-    # ---------------------------------------------------------- print_stats
-
     def print_stats(self) -> None:
-        """Print a comprehensive profiling report.
+        """Print operation summary, tensor categorization, activation lifetimes, and peak memory."""
 
-        The report contains four sections:
-        1. Operation summary table (per-node timing and memory).
-        2. Tensor categorization (counts and totals by role).
-        3. Intermediate activation lifetime table.
-        4. Peak memory estimate.
-        """
-
-        # === Section 1: Operation summary ==================================
+        # Section 1: Operation summary
         print("\n" + "=" * 90)
         print("OPERATION SUMMARY")
         print("=" * 90)
-        print(
-            f"{'#':<5} {'Node':<35} {'Region':<10} "
-            f"{'Time(ms)':>10} {'Mem(B)':>12}"
-        )
+        print(f"{'#':<5} {'Node':<35} {'Region':<10} {'Time(ms)':>10} {'Mem(B)':>12}")
         print("-" * 90)
-
         for i, node in enumerate(self.node_list):
-            name = node.name[:34]
             region = self.node_region.get(node, Region.OTHER).name[:9]
             rt = self.avg_runtimes.get(node.name, 0.0)
             md = self.avg_mem_deltas.get(node.name, 0.0)
-            print(
-                f"{i:<5} {name:<35} {region:<10} "
-                f"{rt:>10.3f} {md:>+12.0f}"
-            )
+            print(f"{i:<5} {node.name[:34]:<35} {region:<10} {rt:>10.3f} {md:>+12.0f}")
 
-        # === Section 2: Tensor categorization ==============================
+        # Section 2: Tensor categorization
         print("\n" + "=" * 90)
         print("TENSOR CATEGORIZATION")
         print("=" * 90)
-
         role_counts: Dict[NodeType, int] = {}
         role_bytes: Dict[NodeType, int] = {}
-
         for node, ntype in self.node_types.items():
             role_counts[ntype] = role_counts.get(ntype, 0) + 1
-            role_bytes[ntype] = (
-                role_bytes.get(ntype, 0)
-                + self.node_sizes.get(node.name, 0)
-            )
-
+            role_bytes[ntype] = role_bytes.get(ntype, 0) + self.node_sizes.get(node.name, 0)
         for ntype in [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPTIMIZER_STATE, NodeType.OTHER]:
-            count = role_counts.get(ntype, 0)
-            nbytes = role_bytes.get(ntype, 0)
-            print(
-                f"  {ntype.name:<18} count={count:<6} "
-                f"total={nbytes / 1024:>10.2f} KB"
-            )
+            print(f"  {ntype.name:<18} count={role_counts.get(ntype, 0):<6} total={role_bytes.get(ntype, 0) / 1024:>10.2f} KB")
 
-        # === Section 3: Intermediate activation lifetimes ==================
+        # Section 3: Intermediate activation lifetimes
         print("\n" + "=" * 90)
         print("INTERMEDIATE ACTIVATION LIFETIMES")
         print("=" * 90)
-        print(
-            f"{'Name':<30} {'Size(KB)':>10} {'LastFwd':>8} {'FirstBwd':>9} "
-            f"{'Lifetime':>9} {'Recomp(ms)':>11} "
-            f"{'SwapOut(ms)':>12} {'SwapIn(ms)':>11}"
-        )
+        print(f"{'Name':<30} {'Size(KB)':>10} {'LastFwd':>8} {'FirstBwd':>9} {'Lifetime':>9} {'Recomp(ms)':>11} {'SwapOut(ms)':>12} {'SwapIn(ms)':>11}")
         print("-" * 110)
-
         total_act_mem = 0
         for node in self.intermediate_nodes:
             info = self.intermediate_info[node]
-            name = node.name[:29]
-            size_kb = info.memory_size / 1024
             lifetime = info.first_bwd_access - info.last_fwd_access
             total_act_mem += info.memory_size
-            print(
-                f"{name:<30} {size_kb:>10.2f} {info.last_fwd_access:>8} "
-                f"{info.first_bwd_access:>9} {lifetime:>9} "
-                f"{info.recompute_cost_ms:>11.4f} "
-                f"{info.swap_out_time_ms:>12.4f} "
-                f"{info.swap_in_time_ms:>11.4f}"
-            )
-
+            print(f"{node.name[:29]:<30} {info.memory_size / 1024:>10.2f} {info.last_fwd_access:>8} {info.first_bwd_access:>9} {lifetime:>9} {info.recompute_cost_ms:>11.4f} {info.swap_out_time_ms:>12.4f} {info.swap_in_time_ms:>11.4f}")
         print(f"\nTotal intermediate activations: {len(self.intermediate_nodes)}")
-        print(
-            f"Total activation memory: {total_act_mem / 1024:.2f} KB "
-            f"({total_act_mem / (1024 * 1024):.2f} MB)"
-        )
+        print(f"Total activation memory: {total_act_mem / 1024:.2f} KB ({total_act_mem / (1024 * 1024):.2f} MB)")
 
-        # === Section 4: Peak memory estimate ===============================
+        # Section 4: Peak memory estimate
         print("\n" + "=" * 90)
         print("PEAK MEMORY ESTIMATE")
         print("=" * 90)
-
         live_mem = self._compute_live_memory_timeline()
         if live_mem:
             peak_step = max(range(len(live_mem)), key=lambda t: live_mem[t])
             peak_bytes = live_mem[peak_step]
-            peak_node = (
-                self.node_list[peak_step]
-                if peak_step < len(self.node_list)
-                else None
-            )
-            print(
-                f"  Peak memory: {peak_bytes / (1024 * 1024):.2f} MB "
-                f"at step {peak_step}"
-                + (f" ({peak_node.name})" if peak_node else "")
-            )
+            peak_node = self.node_list[peak_step] if peak_step < len(self.node_list) else None
+            print(f"  Peak memory: {peak_bytes / (1024 * 1024):.2f} MB at step {peak_step}" + (f" ({peak_node.name})" if peak_node else ""))
         else:
             print("  (no memory data)")
-
         print("=" * 90 + "\n")
 
-    # ---------------------------------------- live memory timeline helpers
-
     def _compute_live_memory_timeline(self) -> List[int]:
-        """Compute total live memory (bytes) at each step in the timeline.
-
-        A tensor produced at step ``p`` by a call_function or placeholder node
-        is live at step ``t`` if ``p <= t <= last_use``, where ``last_use`` is
-        the maximum index among the node's users.
-
-        Returns
-        -------
-        list of int
-            Total live bytes at each step.
-        """
+        """Total live memory (bytes) at each step. A tensor is live from production to last use."""
         n_steps = len(self.node_list)
         timeline = [0] * n_steps
-
         for node in self.node_list:
             if node.op not in (OP.CALL_FUNCTION, OP.PLACEHOLDER):
                 continue
             size = self.node_sizes.get(node.name, 0)
             if size == 0:
                 continue
-
             produced_at = self.node_to_idx[node]
-            user_indices = [
-                self.node_to_idx[u]
-                for u in node.users
-                if u in self.node_to_idx
-            ]
+            user_indices = [self.node_to_idx[u] for u in node.users if u in self.node_to_idx]
             last_use = max(user_indices) if user_indices else produced_at
-
             for t in range(produced_at, min(last_use + 1, n_steps)):
                 timeline[t] += size
-
         return timeline
 
-    def _compute_live_memory_timeline_by_role(
-        self,
-    ) -> Dict[NodeType, List[int]]:
-        """Like _compute_live_memory_timeline but broken down by NodeType.
-
-        Returns
-        -------
-        dict mapping NodeType -> list of int
-            Per-role live memory at each step.
-        """
+    def _compute_live_memory_timeline_by_role(self) -> Dict[NodeType, List[int]]:
+        """Like _compute_live_memory_timeline but broken down by NodeType."""
         n_steps = len(self.node_list)
-        by_role: Dict[NodeType, List[int]] = {
-            nt: [0] * n_steps for nt in NodeType
-        }
-
+        by_role: Dict[NodeType, List[int]] = {nt: [0] * n_steps for nt in NodeType}
         for node in self.node_list:
             if node.op not in (OP.CALL_FUNCTION, OP.PLACEHOLDER):
                 continue
             size = self.node_sizes.get(node.name, 0)
             if size == 0:
                 continue
-
             role = self.node_types.get(node, NodeType.OTHER)
             produced_at = self.node_to_idx[node]
-            user_indices = [
-                self.node_to_idx[u]
-                for u in node.users
-                if u in self.node_to_idx
-            ]
+            user_indices = [self.node_to_idx[u] for u in node.users if u in self.node_to_idx]
             last_use = max(user_indices) if user_indices else produced_at
-
             for t in range(produced_at, min(last_use + 1, n_steps)):
                 by_role[role][t] += size
-
         return by_role
