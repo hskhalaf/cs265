@@ -4,3 +4,13 @@ __pycache__/
 *.png
 .claude/
 .DS_Store
+REPORT.md
+REPORT.pdf
+slides.md
+slides.pdf
+speaker_notes.tex
+speaker_notes.pdf
+speaker_notes.aux
+speaker_notes.log
+speaker_notes.out
+speaker_notes.toc

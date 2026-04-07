@@ -1,11 +1,3 @@
-"""
-Graph Tracer — traces a training step into a single FX graph.
-
-Provided by the CS265 course starter code (Qitong Wang, DASLab).
-Captures forward + backward + optimizer into one rewritable GraphModule
-using make_fx() with FakeTensorMode.
-"""
-
 from contextlib import contextmanager, nullcontext
 from copy import copy
 from dataclasses import dataclass
@@ -30,13 +22,8 @@ from torch.nn.utils import stateless
 from torch.utils.hooks import RemovableHandle
 
 
-# --- Separator ops: identity functions that mark forward/backward boundaries ---
-
-def sep(x: torch.Tensor) -> torch.Tensor:
-    return x
-
-def sep_backward(grad: torch.Tensor) -> torch.Tensor:
-    return grad
+def sep(x: torch.Tensor) -> torch.Tensor: return x
+def sep_backward(grad: torch.Tensor) -> torch.Tensor: return grad
 
 separator_lib = torch.library.Library("separator", "DEF")
 separator_lib.define("sep(Tensor x) -> Tensor")
@@ -59,6 +46,8 @@ DTensor._op_dispatcher.sharding_propagator.register_sharding_prop_rule(
 class SEPFunction(torch.autograd.Function):
     """Custom autograd function that inserts %sep / %sep_backward marker nodes."""
     @staticmethod
+
+    # Called when we do SEPFunction.apply(loss) during the training step.
     def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
         return torch.ops.separator.sep(x)
 
@@ -66,16 +55,10 @@ class SEPFunction(torch.autograd.Function):
     def backward(ctx: Any, grad_x: torch.Tensor) -> torch.Tensor:
         return torch.ops.separator.sep_backward(grad_x)
 
-
-# --- Gradient tagging (for SPMD, removed after tracing) ---
-
 _spmd_lib_def = torch.library.Library("dummy", "DEF")
 _spmd_lib_def.define("tag_grad(Tensor self) -> Tensor")
 _spmd_lib_impl = torch.library.Library("dummy", "IMPL")
 _spmd_lib_impl.impl("tag_grad", lambda x: x, "CompositeExplicitAutograd")
-
-
-# --- Input flattening ---
 
 class _PyTreeCodeGenOutputsOnly(_PyTreeCodeGen):
     def process_inputs(self, *args: Any) -> Any:
@@ -85,20 +68,11 @@ class _PyTreeCodeGenOutputsOnly(_PyTreeCodeGen):
 
 
 def _to_caller_flattened_graph_module(gm: fx.GraphModule) -> fx.GraphModule:
-    """Shift input flattening responsibility from graph module to caller."""
-    gm._graph._codegen = _PyTreeCodeGenOutputsOnly(
-        pytree_info=_PyTreeInfo(
-            orig_args=None,
-            in_spec=None,
-            out_spec=gm._graph._codegen.pytree_info.out_spec,
-        )
-    )
+    gm._graph._codegen = _PyTreeCodeGenOutputsOnly(pytree_info=_PyTreeInfo(orig_args=None, in_spec=None, out_spec=gm._graph._codegen.pytree_info.out_spec,))
     gm.graph.eliminate_dead_code()
     gm.recompile()
     return gm
 
-
-# --- Context managers for tracing ---
 
 @contextmanager
 def gradients_tagging(params: Dict[str, nn.Parameter]):
@@ -142,9 +116,6 @@ def _enable_compile():
     finally:
         torch._utils.is_compiling.__code__ = orig
 
-
-# --- Compilation ---
-
 @dataclass
 class _CompiledResult:
     gm: fx.GraphModule
@@ -154,7 +125,6 @@ class _CompiledResult:
 
 
 def _compile(func: Callable, *args: Any, **kwargs: Any):
-    """Trace func into an FX graph containing forward + backward + optimizer."""
     # 1. Extract model and optimizer from args.
     mod, opt = None, None
     for arg in pytree.tree_flatten(list(args) + list(kwargs.values()))[0]:
@@ -167,6 +137,9 @@ def _compile(func: Callable, *args: Any, **kwargs: Any):
     assert mod is not None
 
     # 2. Lift parameters, buffers, optimizer state as function arguments.
+    # make_fx can only trace operations on function arguments. 
+    # But when train_step runs model(batch), the model accesses its weights via self.weight. This is an internal attribute and not a function argument, 
+    #We need to pull everything out of the model and optimizer and pass them as explicit function arguments
     params = dict(mod.named_parameters(remove_duplicate=False))
     buffers = dict(mod.named_buffers(remove_duplicate=False))
     named_states: Dict[str, nn.Parameter] = {}
@@ -174,7 +147,10 @@ def _compile(func: Callable, *args: Any, **kwargs: Any):
         if p in opt.state:
             named_states[n] = opt.state[p]
 
+    # make_fx will trace this function instead of train_step directly.
     def stateless_func(func, params, buffers, named_states, args, kwargs):
+        # Temporarily swap the model's internal parameters with the ones passed as arguments. 
+        # After this, when train_step calls model(batch) and the model internally accesses self.mod[0].weight, it gets the params["mod.0.weight"] 
         with stateless._reparametrize_module(mod, {**params, **buffers}), \
              _rematerialize_optimizer(opt, named_states, params) if opt else nullcontext():
             with gradients_tagging(params):

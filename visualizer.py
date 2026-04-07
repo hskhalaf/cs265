@@ -1,22 +1,11 @@
-"""
-Memory Visualizer for CS265 Activation Checkpointing Project.
-
-Produces a stacked bar chart showing GPU memory usage over the timeline of
-graph execution, broken down by tensor role (PARAM, ACT, GRAD, OTHER).
-The peak memory step is annotated with a dashed vertical line.
-"""
-
 from typing import Dict, List, Optional
-
 import matplotlib
-matplotlib.use("Agg")  # Non-interactive backend for headless environments.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
 from graph_prof import GraphProfiler, NodeType, Region
 
-
-# Colours and display order (bottom to top).
 _ROLE_STYLE = {
     NodeType.PARAM:          {"color": "#4C72B0", "label": "Parameter"},
     NodeType.ACT:            {"color": "#55A868", "label": "Activation"},
@@ -28,15 +17,6 @@ _ROLE_ORDER = [NodeType.PARAM, NodeType.ACT, NodeType.GRAD, NodeType.OPTIMIZER_S
 
 
 class MemoryVisualizer:
-    """Generates memory breakdown charts from profiler data.
-
-    Parameters
-    ----------
-    profiler : GraphProfiler
-        A profiler that has already been run and had ``aggregate_stats()``
-        called.
-    """
-
     def __init__(self, profiler: GraphProfiler):
         self.profiler = profiler
 

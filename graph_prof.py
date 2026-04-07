@@ -1,9 +1,6 @@
 """
-FX Graph Profiler — static analysis + runtime profiling for activation checkpointing.
-
-Extends torch.fx.Interpreter to execute a traced FX graph node-by-node,
-classifying tensors (PARAM, ACT, GRAD, OPTIMIZER_STATE, OTHER), computing
-activation lifetimes, and measuring per-node timing and memory.
+This code extends torch.fx.Interpreter to execute a traced FX graph node-by-node.
+It classifies tensors, computes the lifetimes of activations, and measures per-node timing and memory.
 """
 
 from enum import Enum
@@ -15,12 +12,12 @@ import torch.fx as fx
 
 
 class OP(str, Enum):
-    CALL_FUNCTION = "call_function"
+    CALL_FUNCTION = "call_function" # an actual computation (relu, ...)
     CALL_MODULE = "call_module"
-    CALL_METHOD = "call_method"
+    CALL_METHOD = "call_method" 
     GET_ATTR = "get_attr"
-    OUTPUT = "output"
-    PLACEHOLDER = "placeholder"
+    OUTPUT = "output" # return value of the graph
+    PLACEHOLDER = "placeholder" # an input to the graph (parameters, optimizer states, batch data)
 
 
 class NodeType(Enum):
@@ -31,7 +28,7 @@ class NodeType(Enum):
     OTHER = 4
 
 
-class Region(Enum):
+class Region(Enum): # based on a node's position wrt to sep_index and sep_bwd_index.
     FORWARD = 0
     LOSS = 1
     BACKWARD = 2
@@ -42,9 +39,11 @@ class Region(Enum):
 @dataclass
 class IntermediateInfo:
     node: fx.Node
+    # filled during __init__
     memory_size: int = 0
     last_fwd_access: int = -1
     first_bwd_access: int = -1
+    # filled after profiling run
     inactive_time_ms: float = 0.0
     recompute_cost_ms: float = 0.0
     swap_out_time_ms: float = 0.0
@@ -52,7 +51,6 @@ class IntermediateInfo:
 
 
 def _tensor_size_bytes(val: Any) -> int:
-    """Size in bytes of a tensor or tuple of tensors. Returns 0 for non-tensors."""
     if isinstance(val, torch.Tensor):
         return val.numel() * val.element_size()
     if isinstance(val, (tuple, list)):
@@ -61,14 +59,14 @@ def _tensor_size_bytes(val: Any) -> int:
 
 
 class GraphProfiler(fx.Interpreter):
-
+    # We override __init__, run, and run_node of fx.Interpreter to add our profiling logic on top.
     def __init__(self, module: fx.GraphModule, garbage_collect_values: bool = True):
         super().__init__(module, garbage_collect_values)
 
         self.node_list: List[fx.Node] = list(self.module.graph.nodes)
         self.node_to_idx: Dict[fx.Node, int] = {n: i for i, n in enumerate(self.node_list)}
 
-        # 1. Find separator nodes (%sep, %sep_backward) that mark forward/backward boundaries.
+        # 1. Find separator nodes (%sep, %sep_backward). These partition the entire graph.
         self.sep_node: Optional[fx.Node] = None
         self.sep_bwd_node: Optional[fx.Node] = None
         self.sep_index: int = -1
@@ -83,13 +81,12 @@ class GraphProfiler(fx.Interpreter):
                     self.sep_bwd_node = node
                     self.sep_bwd_index = i
 
-        assert self.sep_node is not None, "Could not find %sep node"
-        assert self.sep_bwd_node is not None, "Could not find %sep_backward node"
+        assert self.sep_node is not None, "Could not find sep node"
+        assert self.sep_bwd_node is not None, "Could not find sep_backward node"
 
         # 2. Find optimizer boundary and identify parameters/gradients.
-        #    Strategy A: _fused_adam node (fused=True) — read params/grads from args.
-        #    Strategy B: _foreach_* ops (foreach=True) — params = placeholders with
-        #                users in both forward and optimizer regions.
+        #    Strategy A: _fused_adam node (fused=True) => read params/grads from args.
+        #    Strategy B: _foreach_* ops (foreach=True) => params = placeholders with users in both forward and optimizer regions.
         self.optimizer_node: Optional[fx.Node] = None
         self.optimizer_index: int = -1
 
@@ -110,6 +107,7 @@ class GraphProfiler(fx.Interpreter):
         self.param_nodes: Set[fx.Node] = set()
         self.grad_nodes: Set[fx.Node] = set()
 
+        #  Identify parameters: for each PLACEHOLDER node, check if it has users in both forward AND optimizer
         if self.optimizer_node is not None:
             self.param_nodes = set(self.optimizer_node.args[0])
             self.grad_nodes = set(self.optimizer_node.args[1])
@@ -138,6 +136,9 @@ class GraphProfiler(fx.Interpreter):
                 self.node_region[node] = Region.OTHER
 
         # 4. Classify each node's tensor type.
+
+        # We loop through all placeholder nodes that aren't already identified as params or grads. 
+        # For each, are ALL its users in the optimizer region? If yes, it's an optimizer state.
         self.optimizer_state_nodes: Set[fx.Node] = set()
         if self.optimizer_index >= 0:
             for node in self.node_list:
@@ -166,6 +167,7 @@ class GraphProfiler(fx.Interpreter):
             idx = self.node_to_idx[node]
             if idx >= self.sep_index or node.op != OP.CALL_FUNCTION or node in self.param_nodes:
                 continue
+            # Does this node have at least one user in the backward region? If not, skip.
             if not any(self.node_to_idx.get(u, -1) >= self.sep_bwd_index for u in node.users):
                 continue
 
@@ -183,12 +185,18 @@ class GraphProfiler(fx.Interpreter):
             self.node_types[node] = NodeType.ACT
 
         # Build swap schedule: at each step, which intermediates to swap out/in.
+
+        # EXAMPLE: consider relu with last_fwd=87,  first_bwd=121 => 
+        # _swap_out_at = {87: ["relu"]}
+        # _swap_in_at = {121: ["relu"]}
+
         self._intermediate_name_to_node: Dict[str, fx.Node] = {n.name: n for n in self.intermediate_nodes}
 
+        # when should I move this tensor to CPU? at its last_fwd_access step
         self._swap_out_at: Dict[int, List[str]] = {}
         for info in self.intermediate_info.values():
             self._swap_out_at.setdefault(info.last_fwd_access, []).append(info.node.name)
-
+        # when should I bring this tensor back? at its first_bwd_access step
         self._swap_in_at: Dict[int, List[str]] = {}
         for info in self.intermediate_info.values():
             if info.first_bwd_access >= 0:
@@ -214,35 +222,56 @@ class GraphProfiler(fx.Interpreter):
         self._cpu_store.clear()
         return super().run(*args, initial_env=initial_env, enable_io_processing=enable_io_processing)
 
+    # this helps collect four numbers phase 2 needs:  
+    # (1) How long does this node take to execute? 
+    # (2) memory_size, memory delta confirms our static size estimate
+    # (3) How long does the PCIe transfer take for each tensor? 
+    # (4) How long does the tensor sit idle? inactive_time_ms
+
     def run_node(self, n: fx.Node) -> Any:
+
+
         idx = self.node_to_idx[n]
 
         # Swap-in: bring intermediates back from CPU before their first backward use.
+        # Check the timetable: does step idx need any tensors swapped back from CPU?
         for name in self._swap_in_at.get(idx, []):
             if name not in self._cpu_store:
                 continue
+            # Grab the tensor from CPU storage and remove it from the dict => free cpu memory
             cpu_tensor = self._cpu_store.pop(name)
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record()
+            # This copies the tensor's bytes from CPU RAM to GPU memory
             gpu_tensor = cpu_tensor.cuda()
             end.record()
+            # Python blocks here until the GPU finishes everything 
             torch.cuda.synchronize()
             self._swap_in_times.setdefault(name, []).append(start.elapsed_time(end))
+            #  We need the node object because self.env is keyed by node
             source_node = self._intermediate_name_to_node.get(name)
+            # Write the GPU tensor into the interpreter's environment
             if source_node is not None:
-                self.env[source_node] = gpu_tensor
+                self.env[source_node] = gpu_tensor #  self.env maps each node to the actual tensor it produced
 
-        # Execute the node with timing + memory measurement.
         start_event, end_event = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         mem_before = torch.cuda.memory_allocated()
         start_event.record()
+
+        # super() is fx.Interpreter. Its run_node does three things:
+        # (1) Reads n's input nodes from self.env
+        # (2) Calls the ATen op
+        # (3) Stores the node output tensor in self.env[n] — now self.env[relu_node] holds the relu output
         result = super().run_node(n)
         end_event.record()
+
+        # Block Python until the GPU finishes the kernel and records end_event
         torch.cuda.synchronize()
+
         self._node_runtimes.setdefault(n.name, []).append(start_event.elapsed_time(end_event))
         self._node_mem_deltas.setdefault(n.name, []).append(torch.cuda.memory_allocated() - mem_before)
 
-        # Swap-out: move intermediates to CPU after their last forward use.
+        # Swap-out: move intermediates to CPU after their last forward use. At step idx, which tensors should be moved to CPU?
         for name in self._swap_out_at.get(idx, []):
             source_node = self._intermediate_name_to_node.get(name)
             if source_node is None or source_node not in self.env:

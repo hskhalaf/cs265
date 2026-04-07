@@ -1,5 +1,5 @@
 """
-Phase 2:  decide which activations to recompute vs retain, using a memory simulator and cascading recomputation costs.
+PHASE 2:  Decide which activations to recompute vs retain.
 """
 
 import torch
@@ -12,8 +12,7 @@ from graph_tracer import SEPFunction
 from graph_prof import GraphProfiler, IntermediateInfo, NodeType, OP
 
 
-# Takes the profiler (which has all the graph data) and a set of nodes we've decided to evict. 
-# Returns the estimated peak memory in bytes. 
+# Takes the profiler (which has all the graph data) and a set of nodes we've decided to evict. Returns the estimated peak memory in bytes. 
 # This gets called repeatedly by the greedy algorithm (once after each eviction) to check if we've reduced peak enough.
 
 def _simulate_peak_memory(profiler: GraphProfiler, evicted: Set[fx.Node]) -> int:
@@ -32,7 +31,7 @@ def _simulate_peak_memory(profiler: GraphProfiler, evicted: Set[fx.Node]) -> int
         last_use = max(user_indices) if user_indices else produced_at # Find the latest step that consumes this tensor. 
 
         if node in evicted:
-            # Even though we're evicting it, it must still be computed during the forward pass; we just won't keep the result
+            # Even though we're evicting it, it must still be computed during the forward pass. We just won't keep the result
             info = profiler.intermediate_info[node]
             for t in range(produced_at, min(info.last_fwd_access + 1, n_steps)):
                 timeline[t] += size
@@ -47,7 +46,6 @@ def _simulate_peak_memory(profiler: GraphProfiler, evicted: Set[fx.Node]) -> int
 
 
 def select_activations_to_recompute(profiler: GraphProfiler, mem_limit: Optional[int] = None) -> Tuple[List[fx.Node], List[fx.Node]]:
-    '''Takes the profiler (with all static + runtime data) and an optional memory target. Returns two lists: nodes to evict and nodes to keep.'''
     if not profiler.intermediate_nodes:
         return [], []
 
