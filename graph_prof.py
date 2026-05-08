@@ -10,7 +10,7 @@ node and collect, per node:
 and, statically:
 
 * a region per node (FORWARD / LOSS / BACKWARD / OPTIMIZER)
-* a tensor role per node (PARAM / ACT / GRAD / OPT_STATE / OPT_SCRATCH / OTHER)
+* a tensor role per node (PARAM / ACT / GRAD / OTHER)
 * the set of *intermediate activations* (forward call_function nodes whose
   output is consumed in the backward pass) and their lifetimes
 
@@ -54,13 +54,18 @@ class OP(str, Enum):
 
 
 class NodeType(Enum):
-    PARAM        = "param"
-    ACT          = "activation"
-    GRAD         = "gradient"
-    BWD_SCRATCH  = "backward_scratch"     # backward intermediates that are not final grads
-    OPT_STATE    = "optimizer_state"
-    OPT_SCRATCH  = "optimizer_scratch"
-    OTHER        = "other"
+    """Four roles, matching the base code.
+
+    OTHER absorbs everything that isn't one of the three "first-class" roles:
+    optimizer-state placeholders (Adam moment buffers, step counters), the
+    scratch tensors the foreach optimizer decomposition allocates during the
+    step, and backward-pass intermediates that aren't the final accumulated
+    gradient.  All of these are real GPU memory; "OTHER" is just the label.
+    """
+    PARAM = "param"
+    ACT   = "activation"
+    GRAD  = "gradient"
+    OTHER = "other"
 
 
 class Region(Enum):
@@ -184,20 +189,20 @@ class GraphProfiler(fx.Interpreter):
             else:                         self.region[n] = Region.FORWARD
 
     def _classify_tensors(self) -> None:
-        """Assign every node a NodeType.
+        """Assign every node one of {PARAM, ACT, GRAD, OTHER}.
 
-        - PARAM: an input to the (fused) optimizer.
-        - GRAD : the gradient input list of the optimizer.
-        - OPT_STATE: placeholder used only in the optimizer region.
-        - OPT_SCRATCH: call_function in the optimizer region (foreach scratch).
-        - ACT : tagged later in _find_intermediates.
-        - OTHER: everything else (e.g. constants, scalars).
+        PARAM and GRAD come from the optimizer call: under the fused path
+        they are read directly from ``_fused_adam``'s argument lists, under
+        the foreach path PARAM is "placeholder used in both forward and
+        optimizer" and GRAD is "backward call_function whose output flows
+        into the optimizer".  ACT is filled in later by
+        ``_find_intermediates``.  Everything else is OTHER — opt-state
+        placeholders, foreach scratch tensors, gradient-of-activation
+        intermediates, constants.
         """
         self.params: Set[fx.Node] = set()
         self.grads:  Set[fx.Node] = set()
-        self.opt_states: Set[fx.Node] = set()
 
-        # Find the optimizer call (fused or foreach) to read its argument lists.
         fused_node = next(
             (n for n in self.nodes
              if n.op == OP.CALL_FUNCTION
@@ -208,13 +213,6 @@ class GraphProfiler(fx.Interpreter):
             self.params = set(fused_node.args[0])
             self.grads  = set(fused_node.args[1])
         elif self.opt_idx >= 0:
-            # Foreach path:
-            #   PARAM = placeholder used in BOTH the forward region (model
-            #           reads its weight) AND the optimizer region (Adam
-            #           updates the weight).
-            #   GRAD  = call_function in the backward region whose output is
-            #           consumed by the optimizer (i.e. the final accumulated
-            #           gradient that gets fed into _foreach_*).
             for n in self.nodes:
                 if n.op != OP.PLACEHOLDER:
                     continue
@@ -233,30 +231,11 @@ class GraphProfiler(fx.Interpreter):
                        if u in self.idx):
                     self.grads.add(n)
 
-        # Optimizer state: placeholder used only in the optimizer region.
-        if self.opt_idx >= 0:
-            for n in self.nodes:
-                if n.op != OP.PLACEHOLDER or n in self.params or n in self.grads:
-                    continue
-                user_idx = [self.idx[u] for u in n.users if u in self.idx]
-                if user_idx and all(i >= self.opt_idx for i in user_idx):
-                    self.opt_states.add(n)
-
-        # Default classification.  ACT is filled in later in
-        # _find_intermediates() — until then forward call_functions are
-        # OTHER.
         self.node_type: Dict[fx.Node, NodeType] = {}
         for n in self.nodes:
-            if   n in self.params:     self.node_type[n] = NodeType.PARAM
-            elif n in self.grads:      self.node_type[n] = NodeType.GRAD
-            elif n in self.opt_states: self.node_type[n] = NodeType.OPT_STATE
-            elif n.op == OP.CALL_FUNCTION:
-                r = self.region[n]
-                if   r == Region.OPTIMIZER: self.node_type[n] = NodeType.OPT_SCRATCH
-                elif r == Region.BACKWARD:  self.node_type[n] = NodeType.BWD_SCRATCH
-                else:                       self.node_type[n] = NodeType.OTHER
-            else:
-                self.node_type[n] = NodeType.OTHER
+            if   n in self.params: self.node_type[n] = NodeType.PARAM
+            elif n in self.grads:  self.node_type[n] = NodeType.GRAD
+            else:                  self.node_type[n] = NodeType.OTHER
 
     def _find_intermediates(self) -> None:
         """Forward call_function nodes whose output is read in the backward pass."""
@@ -359,49 +338,71 @@ class GraphProfiler(fx.Interpreter):
 
     # --- pretty printing ---------------------------------------------------- #
 
-    def print_stats(self) -> None:
-        print("\n" + "=" * 90)
-        print("OPERATION SUMMARY")
-        print("=" * 90)
-        print(f"{'#':<5} {'Node':<35} {'Region':<10} {'Time(ms)':>10} {'Size(B)':>12}")
-        print("-" * 90)
-        for i, n in enumerate(self.nodes):
-            print(f"{i:<5} {n.name[:34]:<35} {self.region[n].value:<10}"
-                  f" {self.avg_runtime_ms.get(n.name, 0.0):>10.3f}"
-                  f" {self.node_size_bytes.get(n, 0):>12}")
-
-        print("\n" + "=" * 90)
-        print("TENSOR CATEGORIZATION")
-        print("=" * 90)
+    def _role_totals(self) -> "tuple[Dict[NodeType, int], Dict[NodeType, int]]":
         counts: Dict[NodeType, int] = defaultdict(int)
         bytes_: Dict[NodeType, int] = defaultdict(int)
         for n, nt in self.node_type.items():
             counts[nt] += 1
             bytes_[nt] += self.node_size_bytes.get(n, 0)
+        return counts, bytes_
+
+    def print_summary(self, file=None) -> None:
+        """One-screen summary: role totals + peak + latency."""
+        p = lambda *a, **k: print(*a, **k, file=file) if file else print(*a, **k)
+        counts, bytes_ = self._role_totals()
+        region_counts: Dict[Region, int] = defaultdict(int)
+        for r in self.region.values():
+            region_counts[r] += 1
+
+        p(f"  Nodes: {len(self.nodes)}  "
+          f"(forward {region_counts[Region.FORWARD]}, "
+          f"backward {region_counts[Region.BACKWARD]}, "
+          f"optimizer {region_counts[Region.OPTIMIZER]})")
+        p(f"  Intermediates: {len(self.intermediates)}  "
+          f"({sum(i.size_bytes for i in self.intermediates) / 1024**2:.2f} MB)")
+        p()
+        p(f"  {'Role':<8} {'Nodes':>6} {'Total':>12}")
         for nt in NodeType:
-            print(f"  {nt.name:<18} count={counts[nt]:<6}"
-                  f" total={bytes_[nt] / 1024:>10.2f} KB")
+            p(f"  {nt.name:<8} {counts[nt]:>6} {bytes_[nt] / 1024**2:>9.2f} MB")
+        p()
+        p(f"  Estimated peak:    {self.peak_memory_bytes() / 1024**2:>9.2f} MB")
+        p(f"  Iteration latency: {self.avg_iter_latency_ms:>9.2f} ms"
+          f"  (avg of {len(self._iter_latency_ms)} runs)")
 
-        print("\n" + "=" * 90)
-        print("INTERMEDIATE ACTIVATIONS")
-        print("=" * 90)
-        print(f"{'Name':<30} {'Size(KB)':>10} {'LastFwd':>8} {'FirstBwd':>9}"
-              f" {'Lifetime':>9} {'Recomp(ms)':>11}")
-        print("-" * 80)
-        for inter in self.intermediates:
-            lt = inter.first_bwd_idx - inter.last_fwd_idx
-            print(f"{inter.node.name[:29]:<30} {inter.size_bytes / 1024:>10.2f}"
-                  f" {inter.last_fwd_idx:>8} {inter.first_bwd_idx:>9}"
-                  f" {lt:>9} {inter.recompute_ms:>11.4f}")
-        total_act = sum(i.size_bytes for i in self.intermediates)
-        print(f"\nTotal intermediates: {len(self.intermediates)}"
-              f"  ({total_act / (1024**2):.2f} MB)")
+    def write_full_log(self, path: str) -> None:
+        """Write everything (per-node table, intermediate table, summary)
+        to a text file.  This is what the verbose --debug output used to
+        spam the console with."""
+        with open(path, "w") as f:
+            print("=" * 90, file=f)
+            print("OPERATION SUMMARY", file=f)
+            print("=" * 90, file=f)
+            print(f"{'#':<5} {'Node':<35} {'Region':<10} {'Role':<10}"
+                  f" {'Time(ms)':>10} {'Size(B)':>12}  Target", file=f)
+            print("-" * 110, file=f)
+            for i, n in enumerate(self.nodes):
+                target = str(getattr(n, "target", n.op))[:50]
+                print(f"{i:<5} {n.name[:34]:<35} {self.region[n].value:<10}"
+                      f" {self.node_type[n].value:<10}"
+                      f" {self.avg_runtime_ms.get(n.name, 0.0):>10.3f}"
+                      f" {self.node_size_bytes.get(n, 0):>12}  {target}",
+                      file=f)
 
-        print("\n" + "=" * 90)
-        print("PEAK MEMORY")
-        print("=" * 90)
-        peak = self.peak_memory_bytes()
-        print(f"  Estimated peak: {peak / (1024**2):.2f} MB")
-        print(f"  Iteration latency (avg of {len(self._iter_latency_ms)} runs):"
-              f" {self.avg_iter_latency_ms:.2f} ms")
-        print("=" * 90 + "\n")
+            print("\n" + "=" * 90, file=f)
+            print("INTERMEDIATE ACTIVATIONS", file=f)
+            print("=" * 90, file=f)
+            print(f"{'Name':<30} {'Size(KB)':>10} {'LastFwd':>8}"
+                  f" {'FirstBwd':>9} {'Lifetime':>9} {'Recomp(ms)':>11}",
+                  file=f)
+            print("-" * 80, file=f)
+            for inter in self.intermediates:
+                lt = inter.first_bwd_idx - inter.last_fwd_idx
+                print(f"{inter.node.name[:29]:<30}"
+                      f" {inter.size_bytes / 1024:>10.2f}"
+                      f" {inter.last_fwd_idx:>8} {inter.first_bwd_idx:>9}"
+                      f" {lt:>9} {inter.recompute_ms:>11.4f}", file=f)
+
+            print("\n" + "=" * 90, file=f)
+            print("SUMMARY", file=f)
+            print("=" * 90, file=f)
+            self.print_summary(file=f)

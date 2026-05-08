@@ -31,12 +31,13 @@ from visualizer     import plot_memory_breakdown
 
 
 PLOTS_DIR = "plots"
+LOGS_DIR  = "logs"
 
 # Default batch size per model.  Override with `-b N` on the command line.
 DEFAULT_BATCH = {"dummy": 1000, "resnet18": 16, "resnet50": 16, "bert": 4}
 
 
-def profile_model(name: str, batch_size: int, debug: bool = False) -> None:
+def profile_model(name: str, batch_size: int) -> None:
     print(f"\n{'=' * 70}\nPHASE 1: {name}  (batch_size={batch_size})\n{'=' * 70}")
 
     torch.manual_seed(0)
@@ -47,76 +48,60 @@ def profile_model(name: str, batch_size: int, debug: bool = False) -> None:
 
     def transform(gm, args):
         profiler = GraphProfiler(gm)
-
-        # Run a few iterations: warm up the caches, then take measurements.
         with torch.no_grad():
-            for _ in range(2):
+            for _ in range(2):                # warm-up
                 profiler.run(*args)
             profiler.reset_stats()
-            for _ in range(3):
+            for _ in range(3):                # measurement
                 profiler.run(*args)
         profiler.aggregate_stats()
-        profiler.print_stats()
 
-        # Compare static estimate to measured peak so we know how far off the
-        # FX-visible accounting is from real GPU allocator behaviour.
+        # ---- compute the static-vs-measured peak gap ----
         torch.cuda.reset_peak_memory_stats()
         with torch.no_grad():
             gm(*args)
-        measured = torch.cuda.max_memory_allocated()
+        measured  = torch.cuda.max_memory_allocated()
         estimated = profiler.peak_memory_bytes()
         gap = (measured - estimated) / max(measured, 1) * 100
-        print(f"\n  Static estimate : {estimated / 1024**2:>8.2f} MB")
-        print(  f"  Measured peak   : {measured  / 1024**2:>8.2f} MB")
-        print(  f"  Unaccounted gap : {gap:>8.1f} %"
-                f"   (cuDNN/cuBLAS workspace + allocator overhead)")
-        _print_top_tensors(profiler, k=10)
-        if debug:
-            _print_per_node_debug(profiler)
 
+        # ---- console: concise summary only ----
+        profiler.print_summary()
+        print()
+        print(f"  Static estimate :  {estimated / 1024**2:>9.2f} MB")
+        print(f"  Measured peak   :  {measured  / 1024**2:>9.2f} MB")
+        print(f"  Unaccounted gap :  {gap:>9.1f} %  "
+              f"(cuDNN/cuBLAS workspace + allocator)")
+        _print_top_tensors(profiler, k=5)
+
+        # ---- file: full verbose log ----
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        log_path = f"{LOGS_DIR}/{name}_bs{batch_size}.txt"
+        profiler.write_full_log(log_path)
+        print(f"\n  Full log:  {log_path}")
+
+        # ---- plot ----
         os.makedirs(PLOTS_DIR, exist_ok=True)
         plot_path = f"{PLOTS_DIR}/memory_{name}_bs{batch_size}.png"
         plot_memory_breakdown(profiler, plot_path,
                               title=f"{name} — Memory Breakdown (bs={batch_size})")
+        print(f"  Plot:      {plot_path}")
         return gm
 
     compiled = compile(train_step, transform)
     compiled(model, optim, inputs)
 
 
-def _print_per_node_debug(profiler: GraphProfiler) -> None:
-    """Full per-node table: (name, region, role, bytes, target).
-
-    Useful for spotting nodes that were sized at 0 by the alias-based check
-    when they shouldn't have been, or vice versa.  Look for rows where role
-    or size doesn't match what you'd expect from the target column.
-    """
-    print(f"\n  Per-node debug ({len(profiler.nodes)} nodes):")
-    print(f"  {'#':<5} {'Name':<32} {'Region':<10} {'Role':<14}"
-          f" {'Bytes':>10}  Target")
-    print("  " + "-" * 110)
-    for i, n in enumerate(profiler.nodes):
-        size   = profiler.node_size_bytes.get(n, 0)
-        role   = profiler.node_type.get(n).name
-        region = profiler.region.get(n).name
-        target = str(getattr(n, "target", n.op))[:55]
-        print(f"  {i:<5} {n.name[:31]:<32} {region:<10} {role:<14}"
-              f" {size:>10}  {target}")
-
-
-def _print_top_tensors(profiler: GraphProfiler, k: int = 10) -> None:
-    """Top-K largest tensors and their roles — quick sanity check on what
-    dominates the static peak."""
+def _print_top_tensors(profiler: GraphProfiler, k: int = 5) -> None:
     rows = sorted(
         profiler.node_size_bytes.items(), key=lambda kv: kv[1], reverse=True,
     )[:k]
-    print(f"\n  Top {k} tensors by size:")
-    print(f"  {'#':<3} {'Name':<35} {'Role':<18} {'Size(KB)':>10}")
+    print(f"\n  Top {k} tensors:")
     for i, (node, size) in enumerate(rows):
         if size == 0:
             continue
         role = profiler.node_type.get(node, NodeType.OTHER).name
-        print(f"  {i:<3} {node.name[:34]:<35} {role:<18} {size / 1024:>10.2f}")
+        print(f"    {i+1}.  {node.name[:30]:<30}  {role:<6}"
+              f"  {size / 1024**2:>7.2f} MB")
 
 
 def main():
@@ -127,9 +112,6 @@ def main():
     p.add_argument("-b", "--batch-size", type=int, default=None,
                    help="batch size to use for every selected model "
                         "(overrides the per-model default).")
-    p.add_argument("--debug", action="store_true",
-                   help="dump full per-node table (name, region, role, "
-                        "bytes, target) — useful for spotting accounting bugs.")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -143,7 +125,7 @@ def main():
             continue
         bs = args.batch_size if args.batch_size is not None \
              else DEFAULT_BATCH[name]
-        profile_model(name, bs, debug=args.debug)
+        profile_model(name, bs)
 
     print(f"\nDone.  Plots saved under ./{PLOTS_DIR}/")
 

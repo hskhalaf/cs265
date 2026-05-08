@@ -30,25 +30,18 @@ from graph_prof import GraphProfiler, NodeType
 # Colour palette — kept stable across all charts so the same role looks the
 # same wherever it appears.
 _ROLE_COLOR: Dict[NodeType, str] = {
-    NodeType.PARAM:       "#4C72B0",   # blue
-    NodeType.OPT_STATE:   "#C44E52",   # red
-    NodeType.ACT:         "#55A868",   # green
-    NodeType.GRAD:        "#DD8452",   # orange
-    NodeType.BWD_SCRATCH: "#937860",   # brown — backward intermediates (not final grads)
-    NodeType.OPT_SCRATCH: "#8172B3",   # purple
-    NodeType.OTHER:       "#999999",   # gray
+    NodeType.PARAM: "#4C72B0",   # blue
+    NodeType.ACT:   "#55A868",   # green
+    NodeType.GRAD:  "#DD8452",   # orange
+    NodeType.OTHER: "#999999",   # gray
 }
 
-# Stack order, bottom to top.  Static roles first (params, opt state), then
-# the dynamic ones that swing during the iteration.
+# Stack order, bottom to top.
 _STACK_ORDER: Tuple[NodeType, ...] = (
     NodeType.PARAM,
-    NodeType.OPT_STATE,
+    NodeType.OTHER,
     NodeType.ACT,
     NodeType.GRAD,
-    NodeType.BWD_SCRATCH,
-    NodeType.OPT_SCRATCH,
-    NodeType.OTHER,
 )
 
 
