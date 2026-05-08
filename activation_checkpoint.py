@@ -34,7 +34,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.fx as fx
-from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
 
 from graph_prof import GraphProfiler, OP
 
@@ -200,57 +199,61 @@ def rewrite_with_checkpointing(gm: fx.GraphModule,
     """For each evicted activation, splice a recomputed copy into the
     backward pass and redirect later backward consumers to it.
 
-    The rewriter is intentionally simple:
-    - We process activations in forward order.
-    - Each one gets its own recomputation subgraph extracted via
-      ``_extract_graph_with_inputs_outputs``.  The "inputs" are the boundary
-      of nodes guaranteed alive in the backward pass (placeholders + the
-      retained intermediates + any already-recomputed activations).
-    - The subgraph is spliced in just before the activation's first
-      backward use; later backward uses are redirected to the recomputed
-      output.
+    Algorithm, per evicted activation ``act``:
+
+    1. Walk back from ``act`` until we hit the *boundary* — nodes guaranteed
+       to be alive at backward time (placeholders + retained intermediates).
+       Collect every node strictly between the boundary and ``act``; this is
+       the recomputation **body** in topological order.
+    2. ``node_copy`` each body node into the main graph just before
+       ``act``'s first backward use, building a per-iteration map from
+       original nodes to their copies.  The copy of ``act`` is the
+       "recomputed" tensor.
+    3. Replace ``act`` with the recomputed tensor in every later backward
+       user.
+
+    Each evicted activation gets its own independent body (no shared
+    recomputation across evictions).  This matches the additive cost model
+    that Phase 2 uses when it does the cascading-cost accounting.
     """
     if not to_recompute:
         return gm
 
-    name_to_node = {n.name: n for n in gm.graph.nodes}
-    placeholders = {n for n in gm.graph.nodes if n.op == OP.PLACEHOLDER}
+    placeholders  = {n for n in gm.graph.nodes if n.op == OP.PLACEHOLDER}
     recompute_set = set(to_recompute)
     retain_set    = {i.node for i in profiler.intermediates
                      if i.node not in recompute_set}
-
-    # Boundary grows as we recompute more activations: each recomputed
-    # activation becomes an input candidate for later subgraph extractions.
     boundary: Set[fx.Node] = placeholders | retain_set
-    recomputed: Dict[fx.Node, fx.Node] = {}
 
     for act in sorted(to_recompute, key=lambda n: profiler.idx[n]):
         first_bwd_use = _first_backward_user(act, profiler)
         if first_bwd_use is None:
             continue
 
-        inputs = _gather_recomp_inputs(act, boundary)
-        subgraph = _extract_graph_with_inputs_outputs(
-            joint_graph=gm.graph, inputs=inputs, outputs=[act],
-        )
-
-        new_act = _splice_subgraph_before(
-            gm, subgraph, before=first_bwd_use, name_to_node=name_to_node,
-        )
-        if new_act is None:
+        body = _gather_recomp_body(act, boundary)
+        if not body:
             continue
 
-        # Redirect subsequent backward uses of `act` to the recomputed copy.
+        # Per-iteration map: original node → the just-inserted copy.
+        # Boundary nodes aren't in this map, so arg_transform falls through
+        # to the original (which is correct — boundary nodes are alive).
+        copies: Dict[fx.Node, fx.Node] = {}
+        with gm.graph.inserting_before(first_bwd_use):
+            for orig in body:
+                new = gm.graph.node_copy(
+                    orig,
+                    arg_transform=lambda a: copies.get(a, a),
+                )
+                copies[orig] = new
+
+        new_act = copies[act]
         for user in list(act.users):
             if user is new_act:
                 continue
             if profiler.idx.get(user, -1) >= profiler.sep_bwd_idx:
                 user.replace_input_with(act, new_act)
 
-        recomputed[act] = new_act
-        boundary.add(act)  # other recomputations may reuse this output
-
-    # Remove now-unused detach nodes the autograd tracer left behind.
+    # Remove orphan detach nodes the autograd tracer leaves behind.
     for n in list(gm.graph.nodes):
         if n.target == torch.ops.aten.detach.default and not n.users:
             gm.graph.erase_node(n)
@@ -260,70 +263,28 @@ def rewrite_with_checkpointing(gm: fx.GraphModule,
     return gm
 
 
-def _first_backward_user(act: fx.Node, profiler: GraphProfiler) -> Optional[fx.Node]:
+def _first_backward_user(act: fx.Node,
+                         profiler: GraphProfiler) -> Optional[fx.Node]:
     bwd_users = [(profiler.idx[u], u) for u in act.users
                  if profiler.idx.get(u, -1) >= profiler.sep_bwd_idx]
     return min(bwd_users, default=(None, None))[1]
 
 
-def _gather_recomp_inputs(act: fx.Node, boundary: Set[fx.Node]) -> List[fx.Node]:
-    """Walk back from ``act`` and collect the nearest ancestors that lie on
-    ``boundary`` (placeholders / retained / already-recomputed activations).
-    These are the inputs to the extracted subgraph."""
-    seen: Set[fx.Node] = set()
-    inputs: List[fx.Node] = []
-    stack = list(act.all_input_nodes)
+def _gather_recomp_body(act: fx.Node,
+                        boundary: Set[fx.Node]) -> List[fx.Node]:
+    """Body nodes (in topological order) needed to recompute ``act`` from
+    the boundary.  Excludes the boundary itself; includes ``act``."""
+    needed: Set[fx.Node] = set()
+    stack: List[fx.Node] = [act]
     while stack:
         n = stack.pop()
-        if n in seen:
+        if n in needed or n in boundary:
             continue
-        seen.add(n)
-        if n in boundary:
-            if n not in inputs:
-                inputs.append(n)
-        else:
-            stack.extend(n.all_input_nodes)
-    return inputs
-
-
-def _splice_subgraph_before(
-    gm: fx.GraphModule,
-    subgraph: fx.Graph,
-    before: fx.Node,
-    name_to_node: Dict[str, fx.Node],
-) -> Optional[fx.Node]:
-    """Copy ``subgraph`` (minus its placeholders / output) into ``gm.graph``
-    immediately before ``before``.  Returns the copy of the subgraph's output
-    node, or ``None`` if the subgraph had no body to splice."""
-    sub_to_main: Dict[str, fx.Node] = {}
-    for sn in subgraph.nodes:
-        if sn.op == "placeholder":
-            sub_to_main[sn.name] = name_to_node[sn.name]
-
-    output_target_name: Optional[str] = None
-    for sn in subgraph.nodes:
-        if sn.op == "output":
-            arg = sn.args[0]
-            if isinstance(arg, (tuple, list)):
-                arg = arg[0]
-            output_target_name = arg.name if isinstance(arg, fx.Node) else None
-            break
-
-    last_copy: Optional[fx.Node] = None
-    with gm.graph.inserting_before(before):
-        for sn in subgraph.nodes:
-            if sn.op in ("placeholder", "output"):
-                continue
-            new = gm.graph.node_copy(
-                sn, arg_transform=lambda a: sub_to_main[a.name],
-            )
-            sub_to_main[sn.name] = new
-            name_to_node[new.name] = new
-            last_copy = new
-
-    if output_target_name is not None and output_target_name in sub_to_main:
-        return sub_to_main[output_target_name]
-    return last_copy
+        needed.add(n)
+        stack.extend(n.all_input_nodes)
+    # The graph's nodes are already in topological order, so filter-by-
+    # appearance gives us a valid build order.
+    return [n for n in act.graph.nodes if n in needed]
 
 
 # --------------------------------------------------------------------------- #
