@@ -57,6 +57,7 @@ class NodeType(Enum):
     PARAM        = "param"
     ACT          = "activation"
     GRAD         = "gradient"
+    BWD_SCRATCH  = "backward_scratch"     # backward intermediates that are not final grads
     OPT_STATE    = "optimizer_state"
     OPT_SCRATCH  = "optimizer_scratch"
     OTHER        = "other"
@@ -207,9 +208,13 @@ class GraphProfiler(fx.Interpreter):
             self.params = set(fused_node.args[0])
             self.grads  = set(fused_node.args[1])
         elif self.opt_idx >= 0:
-            # Foreach path: parameters are placeholders used in BOTH the
-            # forward region (model reads its weight) AND the optimizer region
-            # (Adam updates the weight).
+            # Foreach path:
+            #   PARAM = placeholder used in BOTH the forward region (model
+            #           reads its weight) AND the optimizer region (Adam
+            #           updates the weight).
+            #   GRAD  = call_function in the backward region whose output is
+            #           consumed by the optimizer (i.e. the final accumulated
+            #           gradient that gets fed into _foreach_*).
             for n in self.nodes:
                 if n.op != OP.PLACEHOLDER:
                     continue
@@ -218,6 +223,15 @@ class GraphProfiler(fx.Interpreter):
                 in_opt = any(i >= self.opt_idx for i in user_idx)
                 if in_fwd and in_opt:
                     self.params.add(n)
+            for n in self.nodes:
+                if n.op != OP.CALL_FUNCTION:
+                    continue
+                i = self.idx[n]
+                if not (self.sep_bwd_idx <= i < self.opt_idx):
+                    continue
+                if any(self.idx[u] >= self.opt_idx for u in n.users
+                       if u in self.idx):
+                    self.grads.add(n)
 
         # Optimizer state: placeholder used only in the optimizer region.
         if self.opt_idx >= 0:
@@ -228,14 +242,19 @@ class GraphProfiler(fx.Interpreter):
                 if user_idx and all(i >= self.opt_idx for i in user_idx):
                     self.opt_states.add(n)
 
-        # Default classification.
+        # Default classification.  ACT is filled in later in
+        # _find_intermediates() — until then forward call_functions are
+        # OTHER.
         self.node_type: Dict[fx.Node, NodeType] = {}
         for n in self.nodes:
             if   n in self.params:     self.node_type[n] = NodeType.PARAM
             elif n in self.grads:      self.node_type[n] = NodeType.GRAD
             elif n in self.opt_states: self.node_type[n] = NodeType.OPT_STATE
-            elif self.region[n] == Region.OPTIMIZER and n.op == OP.CALL_FUNCTION:
-                self.node_type[n] = NodeType.OPT_SCRATCH
+            elif n.op == OP.CALL_FUNCTION:
+                r = self.region[n]
+                if   r == Region.OPTIMIZER: self.node_type[n] = NodeType.OPT_SCRATCH
+                elif r == Region.BACKWARD:  self.node_type[n] = NodeType.BWD_SCRATCH
+                else:                       self.node_type[n] = NodeType.OTHER
             else:
                 self.node_type[n] = NodeType.OTHER
 
