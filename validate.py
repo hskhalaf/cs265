@@ -1,435 +1,166 @@
 """
-Validation script for CS265 Graph Profiler and AC Selection.
+End-to-end sanity checks for the CS265 project.
 
-Runs three levels of checks:
-1. Profiler accuracy: static peak estimate vs actual GPU measurement.
-2. AC decision sanity: intuitive checks per model architecture.
-3. Memory simulator consistency: single-eviction reduction matches tensor size.
+Three checks per model, run inside the graph-transformation callback so we
+have direct access to the freshly-traced GraphModule:
+
+  1. PROFILER accuracy   — peak_memory_bytes() within 30 % of
+                            torch.cuda.max_memory_allocated().
+  2. AC sanity per arch  — ResNet evicts >= 1 intermediate;
+                            BERT (peak in optimizer region) evicts ~none.
+  3. AC correctness      — the AC-rewritten graph produces outputs within
+                            1 e-4 of the unrewritten graph on the same inputs.
 
 Usage:
-    python validate.py                  # default: DummyModel
-    python validate.py Resnet18         # specify model
-    python validate.py --all            # run all models
+    python validate.py                # default: dummy
+    python validate.py resnet18
+    python validate.py --all
 """
 
+from __future__ import annotations
+
 import sys
-from typing import Any, List, Tuple
+from typing import Dict, List
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.fx as fx
 
-from graph_tracer import SEPFunction, compile as gt_compile
-from graph_prof import GraphProfiler, NodeType, OP
-from activation_checkpoint import (
-    select_activations_to_recompute,
-    _simulate_peak_memory,
-)
+from models                import MODELS, init_optimizer_state
+from graph_tracer          import compile
+from graph_prof            import GraphProfiler
+from activation_checkpoint import select_activations, rewrite_with_checkpointing
 
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
+# How many intermediates we expect each architecture to evict.  These are
+# loose ranges; the goal is to catch obvious regressions, not exact counts.
+EXPECTED_EVICTIONS: Dict[str, tuple] = {
+    "dummy":    (1, 100),     # dense MLP — should evict several relus
+    "resnet18": (1, 200),
+    "resnet50": (1, 500),
+    "bert":     (0, 5),       # peak is in optimizer region — AC ~useless
+}
 
 
-class DummyModel(nn.Module):
-    def __init__(self, layers=10, dim=100):
-        super().__init__()
-        modules = []
-        for _ in range(layers):
-            modules.extend([nn.Linear(dim, dim), nn.ReLU()])
-        self.mod = nn.Sequential(*modules)
-
-    def forward(self, x):
-        return self.mod(x)
-
-
-def _setup_model(name: str):
-    """Return (model, optimizer, example_inputs, train_step) for a model."""
-    dev = torch.device("cuda")
-
-    if name == "DummyModel":
-        model = DummyModel(layers=10, dim=100).to(dev)
-        batch = torch.randn(1000, 100, device=dev)
-        opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
-        example_inputs = batch  # single tensor
-
-        def train_step(model, optim, batch):
-            loss = model(batch).sum()
-            loss = SEPFunction.apply(loss)
-            loss.backward()
-            optim.step()
-            optim.zero_grad()
-
-        return model, opt, example_inputs, train_step
-
-    elif name == "Resnet18":
-        from torchvision.models import resnet18
-
-        with torch.device(dev):
-            model = resnet18()
-        inp = torch.randn(16, 3, 224, 224, device=dev)
-        target = torch.randint(0, 10, (16,), device=dev)
-        opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
-        example_inputs = (inp, target)  # tuple
-
-        def train_step(model, optim, example_inputs):
-            logits = model(example_inputs[0])
-            loss = F.cross_entropy(logits, example_inputs[1])
-            loss = SEPFunction.apply(loss)
-            loss.backward()
-            optim.step()
-            optim.zero_grad()
-
-        return model, opt, example_inputs, train_step
-
-    elif name == "Resnet50":
-        from torchvision.models import resnet50
-
-        with torch.device(dev):
-            model = resnet50()
-        inp = torch.randn(16, 3, 224, 224, device=dev)
-        target = torch.randint(0, 10, (16,), device=dev)
-        opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
-        example_inputs = (inp, target)
-
-        def train_step(model, optim, example_inputs):
-            logits = model(example_inputs[0])
-            loss = F.cross_entropy(logits, example_inputs[1])
-            loss = SEPFunction.apply(loss)
-            loss.backward()
-            optim.step()
-            optim.zero_grad()
-
-        return model, opt, example_inputs, train_step
-
-    elif name == "Bert":
-        from transformers import BertConfig, BertForSequenceClassification
-
-        num_classes = 2
-        seq_len = 128
-        config = BertConfig(
-            vocab_size=30522, hidden_size=768, num_hidden_layers=12,
-            num_attention_heads=12, intermediate_size=3072,
-            max_position_embeddings=512, num_labels=num_classes,
-            torchscript=True,
-        )
-        model = BertForSequenceClassification(config).to(dev)
-
-        input_ids = torch.randint(0, config.vocab_size, (4, seq_len), device=dev)
-        attention_mask = torch.ones(4, seq_len, dtype=torch.long, device=dev)
-        labels = torch.randint(0, num_classes, (4,), device=dev)
-        example_inputs = (input_ids, attention_mask, labels)
-
-        def train_step(model, optim, example_inputs):
-            outputs = model(
-                input_ids=example_inputs[0],
-                attention_mask=example_inputs[1],
-                labels=example_inputs[2],
-            )
-            loss = outputs.loss
-            loss = SEPFunction.apply(loss)
-            loss.backward()
-            optim.step()
-            optim.zero_grad()
-
-        opt = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
-        return model, opt, example_inputs, train_step
-
-    else:
-        raise ValueError(f"Unknown model: {name}")
-
-
-# ---------------------------------------------------------------------------
-# Validation checks
-# ---------------------------------------------------------------------------
-
-
-def _build_profiler(name: str) -> Tuple[GraphProfiler, list]:
-    """Trace, profile, and return (profiler, args)."""
-    model, opt, example_inputs, train_step = _setup_model(name)
-
-    # Init optimizer state.
-    for p in model.parameters():
-        if p.requires_grad:
-            p.grad = torch.rand_like(p)
-    opt.step()
-    opt.zero_grad()
-
-    captured = {}
-
-    def capture(gm: fx.GraphModule, args: Any) -> fx.GraphModule:
-        captured["gm"] = gm
-        captured["args"] = args
-        return gm
-
-    compiled_fn = gt_compile(train_step, capture)
-    compiled_fn(model, opt, example_inputs)
-
-    profiler = GraphProfiler(captured["gm"])
-    args = captured["args"]
-
-    # Warm-up + measurement.
+def _profile(gm, args, iters: int = 3) -> GraphProfiler:
+    profiler = GraphProfiler(gm)
     with torch.no_grad():
         for _ in range(2):
             profiler.run(*args)
         profiler.reset_stats()
-        for _ in range(3):
+        for _ in range(iters):
             profiler.run(*args)
     profiler.aggregate_stats()
+    return profiler
 
-    return profiler, args
 
-
-def check_1_profiler_accuracy(profiler: GraphProfiler, args: list, name: str):
-    """Compare static peak estimate vs actual GPU peak measurement."""
-    print(f"\n{'='*70}")
-    print(f"CHECK 1: Profiler accuracy — {name}")
-    print(f"{'='*70}")
-
-    # Static estimate from our timeline.
-    timeline = profiler._compute_live_memory_timeline()
-    estimated_peak = max(timeline) if timeline else 0
-
-    # Actual GPU measurement.
+def _check_profiler_accuracy(profiler: GraphProfiler, gm, args) -> bool:
+    estimated = profiler.peak_memory_bytes()
     torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
-        profiler.run(*args)
-    actual_peak = torch.cuda.max_memory_allocated()
-
-    ratio = estimated_peak / actual_peak if actual_peak > 0 else 0
-    status = "PASS" if 0.3 < ratio < 3.0 else "FAIL"
-
-    print(f"  Estimated peak (static):  {estimated_peak / 1024**2:>10.2f} MB")
-    print(f"  Actual GPU peak:          {actual_peak / 1024**2:>10.2f} MB")
-    print(f"  Ratio (est/actual):       {ratio:>10.2f}")
-    print(f"  [{status}] Ratio is within reasonable bounds (0.3-3.0x)")
-    print()
-    print(f"  Note: mismatch is expected because the static estimate counts")
-    print(f"  formula-based tensor sizes (numel * element_size) while actual")
-    print(f"  GPU measurement includes CUDA allocator overhead, fragmentation,")
-    print(f"  and temporary buffers invisible to our FakeTensor metadata.")
-
-    return status == "PASS"
+        gm(*args)
+    measured = torch.cuda.max_memory_allocated()
+    if measured == 0:
+        print("  [WARN] measured peak is 0 — skipping accuracy check")
+        return True
+    rel = abs(estimated - measured) / measured
+    print(f"  estimated={estimated / 1024**2:.2f} MB  "
+          f"measured={measured / 1024**2:.2f} MB  rel_err={rel * 100:.1f} %")
+    ok = rel <= 0.30
+    print(f"  [{'PASS' if ok else 'FAIL'}] profiler accuracy "
+          f"(target: within 30 %)")
+    return ok
 
 
-def check_2_ac_decision_sanity(profiler: GraphProfiler, name: str):
-    """Verify AC decisions match architectural expectations."""
-    print(f"\n{'='*70}")
-    print(f"CHECK 2: AC decision sanity — {name}")
-    print(f"{'='*70}")
-
-    to_recompute, to_retain = select_activations_to_recompute(profiler)
-    n_total = len(profiler.intermediate_nodes)
-
-    print(f"  Intermediates: {n_total} total, "
-          f"{len(to_recompute)} recompute, {len(to_retain)} retain")
-
-    all_passed = True
-
-    # Check 2a: recompute + retain = all intermediates, no overlap.
-    recomp_set = set(to_recompute)
-    retain_set = set(to_retain)
-    all_set = set(profiler.intermediate_nodes)
-
-    coverage_ok = (recomp_set | retain_set) == all_set
-    overlap_ok = len(recomp_set & retain_set) == 0
-    status_a = "PASS" if (coverage_ok and overlap_ok) else "FAIL"
-    print(f"  [{status_a}] Full coverage and no overlap")
-    all_passed = all_passed and (status_a == "PASS")
-
-    # Check 2b: recomputed nodes should be cheaper than retained nodes.
-    if to_recompute and to_retain:
-        avg_recomp_cost = sum(
-            profiler.intermediate_info[n].recompute_cost_ms for n in to_recompute
-        ) / len(to_recompute)
-        avg_retain_cost = sum(
-            profiler.intermediate_info[n].recompute_cost_ms for n in to_retain
-        ) / len(to_retain)
-        cheaper = avg_recomp_cost <= avg_retain_cost * 2  # generous margin
-        status_b = "PASS" if cheaper else "WARN"
-        print(f"  [{status_b}] Avg recompute cost ({avg_recomp_cost:.4f} ms) vs "
-              f"avg retain cost ({avg_retain_cost:.4f} ms)")
-        if not cheaper:
-            print(f"         Recomputed ops are more expensive than retained — unusual")
-    else:
-        print(f"  [SKIP] Cannot compare costs (one list empty)")
-
-    # Check 2c: recomputed nodes' inputs must be available.
-    placeholder_set = {n for n in profiler.node_list if n.op == OP.PLACEHOLDER}
-    valid_inputs = placeholder_set | retain_set
-    bad_inputs = []
-    for node in to_recompute:
-        for inp in node.all_input_nodes:
-            if inp in recomp_set:
-                bad_inputs.append((node.name, inp.name))
-    status_c = "PASS" if not bad_inputs else "FAIL"
-    print(f"  [{status_c}] All recomputed nodes have available inputs")
-    if bad_inputs:
-        for node_name, inp_name in bad_inputs[:5]:
-            print(f"         {node_name} depends on evicted {inp_name}")
-    all_passed = all_passed and (status_c == "PASS")
-
-    # Check 2d: model-specific sanity.
-    if name == "DummyModel":
-        recomp_names = {n.name for n in to_recompute}
-        relu_recomputed = sum(1 for n in recomp_names if "relu" in n)
-        status_d = "PASS" if relu_recomputed > 0 else "WARN"
-        print(f"  [{status_d}] DummyModel: {relu_recomputed} relu ops recomputed "
-              f"(expected: cheap ops evicted first)")
-    elif name in ("Resnet18", "Resnet50"):
-        retain_names = {n.name for n in to_retain}
-        conv_retained = sum(1 for n in retain_names if "convolution" in n)
-        status_d = "PASS" if conv_retained > 0 else "WARN"
-        print(f"  [{status_d}] {name}: {conv_retained} convolution ops retained "
-              f"(expected: expensive ops kept)")
-    elif name == "Bert":
-        # BERT's peak is in the optimizer region — AC cannot help.
-        # The algorithm should retain everything (0 recomputed).
-        baseline = _simulate_peak_memory(profiler, evicted=set())
-        all_evicted = _simulate_peak_memory(profiler, evicted=set(profiler.intermediate_nodes))
-        if all_evicted >= baseline:
-            # Peak is not reducible — correct to retain all.
-            status_d = "PASS" if len(to_recompute) == 0 else "WARN"
-            print(f"  [{status_d}] BERT: peak is in optimizer region "
-                  f"(not reducible by AC), {len(to_recompute)} recomputed "
-                  f"(expected: 0)")
-        else:
-            status_d = "PASS" if len(to_recompute) > 0 else "WARN"
-            print(f"  [{status_d}] BERT: {len(to_recompute)} ops recomputed")
-    else:
-        status_d = "PASS"
-
-    return all_passed
+def _check_ac_sanity(name: str, evictions: int, total: int) -> bool:
+    lo, hi = EXPECTED_EVICTIONS.get(name, (0, total))
+    ok = lo <= evictions <= hi
+    print(f"  evicted {evictions}/{total} intermediates "
+          f"(expected {lo}..{hi})")
+    print(f"  [{'PASS' if ok else 'FAIL'}] AC sanity for {name}")
+    return ok
 
 
-def check_3_memory_simulator(profiler: GraphProfiler, name: str):
-    """Verify memory simulator consistency with single-eviction tests."""
-    print(f"\n{'='*70}")
-    print(f"CHECK 3: Memory simulator consistency — {name}")
-    print(f"{'='*70}")
+def _check_ac_correctness(gm, args, profiler, selection) -> bool:
+    """Compare outputs of the original gm and the AC-rewritten gm."""
+    if not selection.to_recompute:
+        print("  [SKIP] no evictions, nothing to check")
+        return True
 
-    baseline_peak = _simulate_peak_memory(profiler, evicted=set())
-    print(f"  Baseline peak: {baseline_peak / 1024**2:.2f} MB")
+    # Run original gm.
+    with torch.no_grad():
+        original_out = gm(*args)
 
-    all_passed = True
+    # Rewrite (note: this mutates gm in place; we already captured outputs).
+    gm_ac = rewrite_with_checkpointing(gm, profiler, selection.to_recompute)
+    with torch.no_grad():
+        rewritten_out = gm_ac(*args)
 
-    # Check 3a: peak with all evictions <= baseline peak.
-    all_evicted_peak = _simulate_peak_memory(
-        profiler, evicted=set(profiler.intermediate_nodes)
-    )
-    status_a = "PASS" if all_evicted_peak <= baseline_peak else "FAIL"
-    print(f"  [{status_a}] Peak with all evicted ({all_evicted_peak / 1024**2:.2f} MB) "
-          f"<= baseline ({baseline_peak / 1024**2:.2f} MB)")
-    all_passed = all_passed and (status_a == "PASS")
+    max_diff = 0.0
+    for a, b in zip(_iter_tensors(original_out), _iter_tensors(rewritten_out)):
+        if a.shape != b.shape:
+            print(f"  [FAIL] shape mismatch: {a.shape} vs {b.shape}")
+            return False
+        max_diff = max(max_diff, (a.float() - b.float()).abs().max().item())
 
-    # Check 3b: single eviction should reduce peak by at most the tensor's size.
-    # Pick the largest intermediate that IS live at the peak step.
-    timeline = profiler._compute_live_memory_timeline()
-    peak_step = max(range(len(timeline)), key=lambda t: timeline[t])
-
-    live_at_peak = []
-    for node in profiler.intermediate_nodes:
-        info = profiler.intermediate_info[node]
-        idx = profiler.node_to_idx[node]
-        user_indices = [profiler.node_to_idx[u] for u in node.users if u in profiler.node_to_idx]
-        last_use = max(user_indices) if user_indices else idx
-        if idx <= peak_step <= last_use and info.memory_size > 0:
-            live_at_peak.append(node)
-
-    if live_at_peak:
-        # Pick largest.
-        test_node = max(live_at_peak, key=lambda n: profiler.intermediate_info[n].memory_size)
-        test_size = profiler.intermediate_info[test_node].memory_size
-
-        single_peak = _simulate_peak_memory(profiler, evicted={test_node})
-        reduction = baseline_peak - single_peak
-
-        # Reduction should be > 0 (tensor was live at peak) and <= tensor size.
-        sensible = (0 < reduction <= test_size * 1.1)  # 10% margin
-        status_b = "PASS" if sensible else "WARN"
-        print(f"  [{status_b}] Evicting '{test_node.name}' "
-              f"({test_size / 1024:.1f} KB): "
-              f"peak drops by {reduction / 1024:.1f} KB "
-              f"(expected: 0 < drop <= {test_size / 1024:.1f} KB)")
-        if not sensible and reduction == 0:
-            print(f"         Tensor may not be live at the peak step in the simulator")
-    else:
-        print(f"  [SKIP] No intermediates live at peak step {peak_step} — "
-              f"peak is dominated by non-activation memory")
-        print(f"         This means AC cannot reduce peak for this model, which is fine")
-
-    # Check 3c: monotonicity — evicting more should never increase peak.
-    sorted_nodes = sorted(
-        profiler.intermediate_nodes,
-        key=lambda n: profiler.intermediate_info[n].memory_size,
-        reverse=True,
-    )
-    evicted = set()
-    prev_peak = baseline_peak
-    monotone = True
-    for node in sorted_nodes[:10]:  # Check first 10.
-        evicted.add(node)
-        new_peak = _simulate_peak_memory(profiler, evicted)
-        if new_peak > prev_peak:
-            monotone = False
-            break
-        prev_peak = new_peak
-
-    status_c = "PASS" if monotone else "FAIL"
-    print(f"  [{status_c}] Monotonicity: evicting more never increases peak")
-    all_passed = all_passed and (status_c == "PASS")
-
-    return all_passed
+    print(f"  max output diff: {max_diff:.2e}")
+    ok = max_diff <= 1e-4
+    print(f"  [{'PASS' if ok else 'FAIL'}] AC correctness "
+          f"(target: max diff <= 1e-4)")
+    return ok
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _iter_tensors(obj):
+    if isinstance(obj, torch.Tensor):
+        yield obj
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            yield from _iter_tensors(item)
 
 
-def validate_model(name: str):
-    """Run all validation checks for a single model."""
-    print(f"\n{'#'*70}")
-    print(f"# VALIDATING: {name}")
-    print(f"{'#'*70}")
+def validate(name: str) -> bool:
+    print(f"\n{'=' * 70}\nVALIDATING: {name}\n{'=' * 70}")
+    if not torch.cuda.is_available():
+        print("  [SKIP] CUDA unavailable")
+        return True
+    torch.manual_seed(0)
+    torch.cuda.empty_cache()
 
-    profiler, args = _build_profiler(name)
+    builder = MODELS[name]
+    model, optim, inputs, train_step = builder()
+    init_optimizer_state(model, optim)
 
-    r1 = check_1_profiler_accuracy(profiler, args, name)
-    r2 = check_2_ac_decision_sanity(profiler, name)
-    r3 = check_3_memory_simulator(profiler, name)
+    results: List[bool] = []
 
-    print(f"\n{'='*70}")
-    print(f"SUMMARY: {name}")
-    print(f"{'='*70}")
-    print(f"  Check 1 (Profiler accuracy):      {'PASS' if r1 else 'FAIL'}")
-    print(f"  Check 2 (AC decision sanity):      {'PASS' if r2 else 'FAIL'}")
-    print(f"  Check 3 (Memory simulator):        {'PASS' if r3 else 'FAIL'}")
-    overall = "ALL PASSED" if (r1 and r2 and r3) else "SOME ISSUES"
-    print(f"  Overall: {overall}")
+    def transform(gm, args):
+        profiler = _profile(gm, args)
+        print("\n  -- check 1: profiler accuracy --")
+        results.append(_check_profiler_accuracy(profiler, gm, args))
 
-    return r1 and r2 and r3
+        selection = select_activations(profiler)
+        print("\n  -- check 2: AC sanity --")
+        results.append(_check_ac_sanity(
+            name, len(selection.to_recompute), len(profiler.intermediates),
+        ))
+
+        print("\n  -- check 3: AC correctness --")
+        results.append(_check_ac_correctness(gm, args, profiler, selection))
+        return gm
+
+    compiled_fn = compile(train_step, transform)
+    compiled_fn(model, optim, inputs)
+    return all(results)
+
+
+def main():
+    args = sys.argv[1:] or ["dummy"]
+    if args == ["--all"]:
+        args = list(MODELS.keys())
+    statuses = {name: validate(name) for name in args}
+    print("\n" + "=" * 70)
+    for name, ok in statuses.items():
+        print(f"  {name:<10} {'PASS' if ok else 'FAIL'}")
+    print("=" * 70)
+    sys.exit(0 if all(statuses.values()) else 1)
 
 
 if __name__ == "__main__":
-    models = ["DummyModel"]
-
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--all":
-            models = ["DummyModel", "Resnet18", "Resnet50", "Bert"]
-        else:
-            models = [sys.argv[1]]
-
-    all_ok = True
-    for name in models:
-        ok = validate_model(name)
-        all_ok = all_ok and ok
-
-    print(f"\n{'#'*70}")
-    if all_ok:
-        print("# ALL MODELS VALIDATED SUCCESSFULLY")
-    else:
-        print("# SOME CHECKS FAILED — review output above")
-    print(f"{'#'*70}")
+    main()

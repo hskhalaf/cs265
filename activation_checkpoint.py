@@ -1,256 +1,366 @@
 """
-PHASE 2:  Decide which activations to recompute vs retain.
+Phases 2 and 3 of the µ-TWO activation-checkpointing pipeline.
+
+Phase 2 — selection
+-------------------
+``select_activations`` runs the µ-TWO greedy algorithm over the profiler's
+intermediates: at each step it evicts the activation with the highest
+``size / recompute_time`` ratio (best memory return per millisecond of
+recomputation), re-simulates the peak with the new eviction set, and stops
+when peak <= the requested limit (default: shrink peak by half the activation
+total) — or when an eviction round fails to lower the peak (the peak isn't
+activation-dominated, so AC can't help).
+
+The simulator (`_simulate_peak`) accounts for the fact that an evicted
+activation still occupies memory briefly during the forward pass (when it is
+produced) and during the backward pass (when it is recomputed on demand).
+
+Cascading recomputation: evicting an upstream activation makes any later
+eviction that depends on it more expensive.  We track this by maintaining a
+per-candidate ``total_recomp_time`` that grows when an ancestor is evicted.
+
+Phase 3 — graph rewriting
+-------------------------
+``rewrite_with_checkpointing`` takes the selection and edits the FX graph in
+place: for each evicted activation we extract its forward-pass subgraph,
+splice a copy of it into the backward pass right before the first backward
+use, and redirect later backward consumers to the recomputed copy.
 """
 
-import torch
-import torch.nn as nn
-import torch.fx as fx
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
-from torch.fx.experimental.proxy_tensor import make_fx
+
+import torch
+import torch.fx as fx
 from torch._functorch.partitioners import _extract_graph_with_inputs_outputs
-from graph_tracer import SEPFunction
-from graph_prof import GraphProfiler, IntermediateInfo, NodeType, OP
+
+from graph_prof import GraphProfiler, OP
 
 
-# Takes the profiler (which has all the graph data) and a set of nodes we've decided to evict. Returns the estimated peak memory in bytes. 
-# This gets called repeatedly by the greedy algorithm (once after each eviction) to check if we've reduced peak enough.
+# --------------------------------------------------------------------------- #
+# Phase 2 — selection                                                         #
+# --------------------------------------------------------------------------- #
 
-def _simulate_peak_memory(profiler: GraphProfiler, evicted: Set[fx.Node]) -> int:
-    n_steps = len(profiler.node_list)
-    timeline = [0] * n_steps # timeline[t] will hold the total bytes of all tensors alive at step t
 
-    for node in profiler.node_list:
-        if node.op not in (OP.CALL_FUNCTION, OP.PLACEHOLDER): # skip output nodes since they do not produce tensors
-            continue
-        size = profiler.node_sizes.get(node.name, 0) # Get this node's tensor size
+@dataclass
+class SelectionResult:
+    to_recompute: List[fx.Node]
+    to_retain:    List[fx.Node]
+    peak_before:  int
+    peak_after:   int
+
+    @property
+    def freed_bytes(self) -> int:
+        return self.peak_before - self.peak_after
+
+
+def _simulate_peak(profiler: GraphProfiler, evicted: Set[fx.Node]) -> int:
+    """Estimate peak live memory if every node in ``evicted`` is recomputed.
+
+    For each node, sum its size into the timeline over the steps where it is
+    live.  An evicted intermediate is live (a) from production through its
+    last forward use, then (b) at the single backward step that recomputes
+    and consumes it.
+    """
+    n = len(profiler.nodes)
+    timeline = [0] * n
+
+    # Look up by node for O(1) eviction info.
+    inter_by_node = {i.node: i for i in profiler.intermediates}
+
+    for node in profiler.nodes:
+        size = profiler.node_size_bytes.get(node, 0)
         if size == 0:
             continue
-
-        produced_at = profiler.node_to_idx[node]
-        user_indices = [profiler.node_to_idx[u] for u in node.users if u in profiler.node_to_idx]
-        last_use = max(user_indices) if user_indices else produced_at # Find the latest step that consumes this tensor. 
+        produced = profiler.idx[node]
+        user_idx = [profiler.idx[u] for u in node.users if u in profiler.idx]
+        last_use = max(user_idx, default=produced)
 
         if node in evicted:
-            # Even though we're evicting it, it must still be computed during the forward pass. We just won't keep the result
-            info = profiler.intermediate_info[node]
-            for t in range(produced_at, min(info.last_fwd_access + 1, n_steps)):
+            inter = inter_by_node[node]
+            # Forward window: produced through last forward use.
+            for t in range(produced, min(inter.last_fwd_idx + 1, n)):
                 timeline[t] += size
-            #  During backward, we'd recompute it on the spot when we need it
-            if 0 <= info.first_bwd_access < n_steps:
-                timeline[info.first_bwd_access] += size 
+            # Backward recomputation spike at first_bwd_idx.
+            if 0 <= inter.first_bwd_idx < n:
+                timeline[inter.first_bwd_idx] += size
         else:
-            for t in range(produced_at, min(last_use + 1, n_steps)):
+            for t in range(produced, min(last_use + 1, n)):
                 timeline[t] += size
-
     return max(timeline) if timeline else 0
 
 
-def select_activations_to_recompute(profiler: GraphProfiler, mem_limit: Optional[int] = None) -> Tuple[List[fx.Node], List[fx.Node]]:
-    if not profiler.intermediate_nodes:
-        return [], []
+def select_activations(profiler: GraphProfiler,
+                       mem_limit: Optional[int] = None) -> SelectionResult:
+    """µ-TWO greedy selection.  Returns a SelectionResult."""
+    inters = profiler.intermediates
+    peak_before = _simulate_peak(profiler, evicted=set())
+    if not inters:
+        return SelectionResult([], [], peak_before, peak_before)
 
-    baseline_peak = _simulate_peak_memory(profiler, evicted=set())
-
-    # Default: aim to reduce peak by half the total activation memory.
+    # Default target: cut peak by half the total activation memory.
     if mem_limit is None:
-        total_act_mem = sum(profiler.intermediate_info[n].memory_size for n in profiler.intermediate_nodes)
-        mem_limit = baseline_peak - (total_act_mem // 2)
+        total_act = sum(i.size_bytes for i in inters)
+        mem_limit = peak_before - total_act // 2
 
-    # Build candidate metadata: size, cost, ratio, recomputation sources.
-    candidates: Dict[fx.Node, dict] = {}
-    for node in profiler.intermediate_nodes:
-        info = profiler.intermediate_info[node]
-        candidates[node] = {
-            "memory_size": info.memory_size,
-            "recomp_time": info.recompute_cost_ms,
-            "total_recomp_time": info.recompute_cost_ms,
-            "recomp_ratio": info.memory_size / (info.recompute_cost_ms + 1e-9),
-            "recomp_srcs": set(),
+    # Quick bail-out: if the peak isn't dominated by activations, AC can't help.
+    if _simulate_peak(profiler, set(i.node for i in inters)) >= peak_before:
+        return SelectionResult([], [i.node for i in inters],
+                               peak_before, peak_before)
+
+    # Per-candidate state: size, total recompute time (grows with cascade),
+    # and the set of intermediate ancestors still alive.
+    intermediate_set = {i.node for i in inters}
+    state: Dict[fx.Node, Dict] = {}
+    for i in inters:
+        ancestors = {a for a in i.node.all_input_nodes if a in intermediate_set}
+        state[i.node] = {
+            "size": i.size_bytes,
+            "cost": i.recompute_ms,
+            "ancestors": ancestors,
+            "ratio": i.size_bytes / (i.recompute_ms + 1e-9),
         }
 
-    # For each intermediate, find which of its inputs are also intermediates. This matter for cascading.
-    intermediate_set = set(profiler.intermediate_nodes)
-    for node in profiler.intermediate_nodes:
-        candidates[node]["recomp_srcs"] = {inp for inp in node.all_input_nodes if inp in intermediate_set}
-
     evicted: Set[fx.Node] = set()
-    eviction_order: List[fx.Node] = []
-    remaining = set(profiler.intermediate_nodes)
-    prev_peak = baseline_peak
+    order:   List[fx.Node] = []
+    remaining = set(intermediate_set)
+    prev_peak = peak_before
 
-    # Quick check: if evicting ALL intermediates doesn't reduce peak, AC can't help.
-    if _simulate_peak_memory(profiler, set(profiler.intermediate_nodes)) >= baseline_peak:
-        return [], list(profiler.intermediate_nodes)
-
-    # Greedy loop: evict best candidate, re-simulate, stop when target met.
     while remaining:
-        current_peak = _simulate_peak_memory(profiler, evicted)
-        if current_peak <= mem_limit: break
-        if eviction_order and current_peak >= prev_peak:  break  # last eviction didn't help so peak is non-activation-dominated
+        peak = _simulate_peak(profiler, evicted)
+        if peak <= mem_limit:
+            break
+        if order and peak >= prev_peak:
+            break  # last eviction didn't help — peak is non-activation-dominated
+        prev_peak = peak
 
-        prev_peak = current_peak
-        # Pick candidate with highest recompute_ratio.
-        best_node = max(remaining, key=lambda n: candidates[n]["recomp_ratio"])
-        evicted.add(best_node)
-        eviction_order.append(best_node)
-        remaining.discard(best_node)
+        best = max(remaining, key=lambda n: state[n]["ratio"])
+        evicted.add(best)
+        order.append(best)
+        remaining.discard(best)
 
-        # Cascading recomputation (Algorithms E/F): if best_node is a recomp_src of another candidate, that candidate's cost increases.
-        for node in remaining:
-            cand = candidates[node]
-            if best_node in cand["recomp_srcs"]:
-                cand["recomp_srcs"].discard(best_node)
-                cand["recomp_srcs"].update(candidates[best_node]["recomp_srcs"])
-                cand["total_recomp_time"] += candidates[best_node]["total_recomp_time"]
-                cand["recomp_ratio"] = cand["memory_size"] / (cand["total_recomp_time"] + 1e-9)
+        # Cascade: every remaining candidate that depends on `best` now pays
+        # `best`'s recompute cost too.
+        for n in remaining:
+            cand = state[n]
+            if best in cand["ancestors"]:
+                cand["ancestors"].discard(best)
+                cand["ancestors"].update(state[best]["ancestors"])
+                cand["cost"]     += state[best]["cost"]
+                cand["ratio"]     = cand["size"] / (cand["cost"] + 1e-9)
 
-    to_recompute = eviction_order
-    to_retain = [n for n in profiler.intermediate_nodes if n not in evicted]
+    to_recompute, to_retain = _validate_recompute_set(
+        order, [i.node for i in inters if i.node not in evicted],
+        placeholders={n for n in profiler.nodes if n.op == OP.PLACEHOLDER},
+    )
+    peak_after = _simulate_peak(profiler, set(to_recompute))
+    return SelectionResult(to_recompute, to_retain, peak_before, peak_after)
 
-    # Validation: ensure every evicted node's inputs are available.
-    placeholder_set = {n for n in profiler.node_list if n.op == OP.PLACEHOLDER}
-    return _validate_recompute_set(to_recompute, to_retain, placeholder_set)
 
+def _validate_recompute_set(
+    to_recompute: List[fx.Node],
+    to_retain:    List[fx.Node],
+    placeholders: Set[fx.Node],
+) -> Tuple[List[fx.Node], List[fx.Node]]:
+    """Move evicted nodes back to retained if their recomputation inputs
+    aren't all reachable.  Iterate to a fixed point.
 
-def _validate_recompute_set(to_recompute: List[fx.Node], to_retain: List[fx.Node], placeholder_set: Set[fx.Node]) -> Tuple[List[fx.Node], List[fx.Node]]:
-    """Move evicted nodes back to retained if their inputs aren't available. Iterate until stable."""
-    recompute_set = set(to_recompute)
-    retain_set = set(to_retain)
-
+    An eviction is *valid* only when every input to the evicted node is
+    either a placeholder or itself retained (or itself a recomputable node
+    whose inputs are valid — handled by iteration).
+    """
+    recompute = set(to_recompute)
+    retain    = set(to_retain)
     changed = True
     while changed:
         changed = False
-        valid_inputs = placeholder_set | retain_set
-        for node in list(recompute_set):
-            if not all(inp in valid_inputs or inp not in recompute_set for inp in node.all_input_nodes):
-                retain_set.add(node)
-                recompute_set.discard(node)
+        valid = placeholders | retain | recompute
+        for n in list(recompute):
+            if not all(inp in valid for inp in n.all_input_nodes):
+                retain.add(n)
+                recompute.discard(n)
                 changed = True
+    # Preserve original ordering.
+    new_recompute = [n for n in to_recompute if n in recompute]
+    new_retain    = [n for n in to_retain    if n in retain]
+    new_retain.extend(n for n in to_recompute if n in retain)
+    return new_recompute, new_retain
 
-    recompute_ordered = [n for n in to_recompute if n in recompute_set]
-    retain_ordered = [n for n in to_retain if n in retain_set]
-    retain_ordered.extend(n for n in to_recompute if n in retain_set)
-    return recompute_ordered, retain_ordered
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — graph rewriting                                                   #
+# --------------------------------------------------------------------------- #
 
 
-def print_ac_decisions(profiler: GraphProfiler, to_recompute: List[fx.Node], to_retain: List[fx.Node]) -> None:
-    """Print recompute/retain decisions with before/after peak memory."""
-    total_saved = sum(profiler.intermediate_info[n].memory_size for n in to_recompute)
-    total_cost = sum(profiler.intermediate_info[n].recompute_cost_ms for n in to_recompute)
-    total_retained = sum(profiler.intermediate_info[n].memory_size for n in to_retain)
-    baseline = _simulate_peak_memory(profiler, evicted=set())
-    after_ac = _simulate_peak_memory(profiler, evicted=set(to_recompute))
+def rewrite_with_checkpointing(gm: fx.GraphModule,
+                               profiler: GraphProfiler,
+                               to_recompute: List[fx.Node]) -> fx.GraphModule:
+    """For each evicted activation, splice a recomputed copy into the
+    backward pass and redirect later backward consumers to it.
+
+    The rewriter is intentionally simple:
+    - We process activations in forward order.
+    - Each one gets its own recomputation subgraph extracted via
+      ``_extract_graph_with_inputs_outputs``.  The "inputs" are the boundary
+      of nodes guaranteed alive in the backward pass (placeholders + the
+      retained intermediates + any already-recomputed activations).
+    - The subgraph is spliced in just before the activation's first
+      backward use; later backward uses are redirected to the recomputed
+      output.
+    """
+    if not to_recompute:
+        return gm
+
+    name_to_node = {n.name: n for n in gm.graph.nodes}
+    placeholders = {n for n in gm.graph.nodes if n.op == OP.PLACEHOLDER}
+    recompute_set = set(to_recompute)
+    retain_set    = {i.node for i in profiler.intermediates
+                     if i.node not in recompute_set}
+
+    # Boundary grows as we recompute more activations: each recomputed
+    # activation becomes an input candidate for later subgraph extractions.
+    boundary: Set[fx.Node] = placeholders | retain_set
+    recomputed: Dict[fx.Node, fx.Node] = {}
+
+    for act in sorted(to_recompute, key=lambda n: profiler.idx[n]):
+        first_bwd_use = _first_backward_user(act, profiler)
+        if first_bwd_use is None:
+            continue
+
+        inputs = _gather_recomp_inputs(act, boundary)
+        subgraph = _extract_graph_with_inputs_outputs(
+            joint_graph=gm.graph, inputs=inputs, outputs=[act],
+        )
+
+        new_act = _splice_subgraph_before(
+            gm, subgraph, before=first_bwd_use, name_to_node=name_to_node,
+        )
+        if new_act is None:
+            continue
+
+        # Redirect subsequent backward uses of `act` to the recomputed copy.
+        for user in list(act.users):
+            if user is new_act:
+                continue
+            if profiler.idx.get(user, -1) >= profiler.sep_bwd_idx:
+                user.replace_input_with(act, new_act)
+
+        recomputed[act] = new_act
+        boundary.add(act)  # other recomputations may reuse this output
+
+    # Remove now-unused detach nodes the autograd tracer left behind.
+    for n in list(gm.graph.nodes):
+        if n.target == torch.ops.aten.detach.default and not n.users:
+            gm.graph.erase_node(n)
+
+    gm.graph.lint()
+    gm.recompile()
+    return gm
+
+
+def _first_backward_user(act: fx.Node, profiler: GraphProfiler) -> Optional[fx.Node]:
+    bwd_users = [(profiler.idx[u], u) for u in act.users
+                 if profiler.idx.get(u, -1) >= profiler.sep_bwd_idx]
+    return min(bwd_users, default=(None, None))[1]
+
+
+def _gather_recomp_inputs(act: fx.Node, boundary: Set[fx.Node]) -> List[fx.Node]:
+    """Walk back from ``act`` and collect the nearest ancestors that lie on
+    ``boundary`` (placeholders / retained / already-recomputed activations).
+    These are the inputs to the extracted subgraph."""
+    seen: Set[fx.Node] = set()
+    inputs: List[fx.Node] = []
+    stack = list(act.all_input_nodes)
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        if n in boundary:
+            if n not in inputs:
+                inputs.append(n)
+        else:
+            stack.extend(n.all_input_nodes)
+    return inputs
+
+
+def _splice_subgraph_before(
+    gm: fx.GraphModule,
+    subgraph: fx.Graph,
+    before: fx.Node,
+    name_to_node: Dict[str, fx.Node],
+) -> Optional[fx.Node]:
+    """Copy ``subgraph`` (minus its placeholders / output) into ``gm.graph``
+    immediately before ``before``.  Returns the copy of the subgraph's output
+    node, or ``None`` if the subgraph had no body to splice."""
+    sub_to_main: Dict[str, fx.Node] = {}
+    for sn in subgraph.nodes:
+        if sn.op == "placeholder":
+            sub_to_main[sn.name] = name_to_node[sn.name]
+
+    output_target_name: Optional[str] = None
+    for sn in subgraph.nodes:
+        if sn.op == "output":
+            arg = sn.args[0]
+            if isinstance(arg, (tuple, list)):
+                arg = arg[0]
+            output_target_name = arg.name if isinstance(arg, fx.Node) else None
+            break
+
+    last_copy: Optional[fx.Node] = None
+    with gm.graph.inserting_before(before):
+        for sn in subgraph.nodes:
+            if sn.op in ("placeholder", "output"):
+                continue
+            new = gm.graph.node_copy(
+                sn, arg_transform=lambda a: sub_to_main[a.name],
+            )
+            sub_to_main[sn.name] = new
+            name_to_node[new.name] = new
+            last_copy = new
+
+    if output_target_name is not None and output_target_name in sub_to_main:
+        return sub_to_main[output_target_name]
+    return last_copy
+
+
+# --------------------------------------------------------------------------- #
+# Reporting                                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def print_ac_decisions(profiler: GraphProfiler,
+                       result: SelectionResult) -> None:
+    inter_by_node = {i.node: i for i in profiler.intermediates}
+    saved = sum(inter_by_node[n].size_bytes for n in result.to_recompute)
+    extra_ms = sum(inter_by_node[n].recompute_ms for n in result.to_recompute)
+    retained = sum(inter_by_node[n].size_bytes for n in result.to_retain)
 
     print("\n" + "=" * 80)
-    print("ACTIVATION CHECKPOINTING DECISIONS (mu-TWO Greedy Selection)")
+    print("ACTIVATION CHECKPOINTING DECISIONS  (µ-TWO greedy)")
     print("=" * 80)
 
-    print(f"\n  Intermediates to RECOMPUTE ({len(to_recompute)}):")
+    print(f"\n  RECOMPUTE ({len(result.to_recompute)}):")
     print(f"  {'Name':<30} {'Size(KB)':>10} {'Recomp(ms)':>11} {'Ratio':>12}")
     print("  " + "-" * 70)
-    for node in to_recompute:
-        info = profiler.intermediate_info[node]
-        ratio = info.memory_size / (info.recompute_cost_ms + 1e-9)
-        print(f"  {node.name:<30} {info.memory_size / 1024:>10.2f} {info.recompute_cost_ms:>11.4f} {ratio:>12.0f}")
+    for n in result.to_recompute:
+        i = inter_by_node[n]
+        ratio = i.size_bytes / (i.recompute_ms + 1e-9)
+        print(f"  {n.name:<30} {i.size_bytes / 1024:>10.2f}"
+              f" {i.recompute_ms:>11.4f} {ratio:>12.0f}")
 
-    print(f"\n  Intermediates to RETAIN ({len(to_retain)}):")
-    print(f"  {'Name':<30} {'Size(KB)':>10}")
-    print("  " + "-" * 42)
-    for node in to_retain:
-        info = profiler.intermediate_info[node]
-        print(f"  {node.name:<30} {info.memory_size / 1024:>10.2f}")
+    print(f"\n  RETAIN ({len(result.to_retain)}):")
+    for n in result.to_retain:
+        i = inter_by_node[n]
+        print(f"  {n.name:<30} {i.size_bytes / 1024:>10.2f} KB")
 
-    print(f"\n  Summary:")
-    print(f"    Peak memory before AC:       {baseline / (1024**2):.2f} MB")
-    print(f"    Peak memory after AC:        {after_ac / (1024**2):.2f} MB")
-    print(f"    Peak reduction:              {(baseline - after_ac) / (1024**2):.2f} MB")
-    print(f"    Activation memory freed:     {total_saved / 1024:.2f} KB ({total_saved / (1024**2):.2f} MB)")
-    print(f"    Extra computation cost:      {total_cost:.4f} ms")
-    print(f"    Activation memory retained:  {total_retained / 1024:.2f} KB ({total_retained / (1024**2):.2f} MB)")
+    print("\n  Summary:")
+    print(f"    Peak before AC: {result.peak_before / (1024**2):>8.2f} MB")
+    print(f"    Peak after  AC: {result.peak_after  / (1024**2):>8.2f} MB")
+    print(f"    Freed:          {result.freed_bytes / (1024**2):>8.2f} MB")
+    print(f"    Activation memory freed:    {saved   / (1024**2):>6.2f} MB")
+    print(f"    Activation memory retained: {retained / (1024**2):>6.2f} MB")
+    print(f"    Extra computation cost:     {extra_ms:>6.2f} ms")
     print("=" * 80 + "\n")
-
-
-def replace_subsequent_uses_of(graph: fx.Graph, old_node: fx.Node, new_node: fx.Node) -> None:
-    """Replace uses of old_node with new_node for nodes after new_node in the graph."""
-    old_node_users = old_node.users
-    for node in reversed(graph.nodes):
-        if node == new_node:
-            break
-        if node in old_node_users:
-            node.replace_input_with(old_node, new_node)
-
-
-def remove_detach_nodes(gm: fx.GraphModule) -> fx.GraphModule:
-    """Remove identity detach nodes inserted by autograd tracing."""
-    for node in gm.graph.nodes:
-        if node.target == torch.ops.aten.detach.default:
-            input_node = node.all_input_nodes[0]
-            node.replace_all_uses_with(input_node)
-            if len(node.users) == 0:
-                gm.graph.erase_node(node)
-    gm.graph.lint()
-    gm.recompile()
-    return gm
-
-
-def get_name_to_node_map(gm: fx.GraphModule) -> Dict[str, fx.Node]:
-    return {node.name: node for node in gm.graph.nodes}
-
-def activation_checkpointing_example(gm: fx.GraphModule) -> fx.GraphModule:
-    name_to_node = get_name_to_node_map(gm)
-    first_back_access = name_to_node["t"]
-    node_to_recompute = [name_to_node["relu"]]
-    node_to_recompute_names = ["relu"]
-    nodes_required = [name_to_node["w1_1"], name_to_node["x_1"]]
-
-    subgraph = _extract_graph_with_inputs_outputs(joint_graph=gm.graph, inputs=nodes_required, outputs=node_to_recompute)
-    subgraph.print_tabular()
-
-    with gm.graph.inserting_before(first_back_access):
-        for n in subgraph.nodes:
-            if n.op in ("placeholder", "output"):
-                continue
-            new_node = gm.graph.node_copy(n, arg_transform=lambda arg: name_to_node[arg.name])
-            if n.name in node_to_recompute_names:
-                replace_subsequent_uses_of(gm.graph, old_node=name_to_node[n.name], new_node=new_node)
-            name_to_node[n.name] = new_node
-
-    gm.graph.lint()
-    gm.recompile()
-    return gm
-
-
-def custom_fn(w1: torch.Tensor, w2: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    z = torch.mm(w1, x)
-    z = nn.functional.relu(z)
-    z = torch.mm(z, w2)
-    z = nn.functional.relu(z)
-    z = z.sum()
-    z = SEPFunction.apply(z)
-    z.backward()
-    return w1.grad, w2.grad
-
-
-if __name__ == "__main__":
-    w1 = torch.randn(1024, 1024, device="cuda", requires_grad=True)
-    w2 = torch.randn(2048, 512, device="cuda", requires_grad=True)
-    x = torch.randn(1024, 2048, device="cuda")
-
-    gm = make_fx(custom_fn)(w1, w2, x)
-    gm = remove_detach_nodes(gm)
-    print("Original graph:")
-    gm.graph.print_tabular()
-
-    with torch.no_grad():
-        old_grads = gm(w1, w2, x)
-
-    new_gm = activation_checkpointing_example(gm)
-    print("After AC:")
-    new_gm.graph.print_tabular()
-
-    with torch.no_grad():
-        new_grads = new_gm(w1, w2, x)
-
-    print("Gradient verification:")
-    for old, new in zip(old_grads, new_grads):
-        print(torch.allclose(old, new))

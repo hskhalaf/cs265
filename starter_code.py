@@ -1,89 +1,65 @@
-import logging
-from typing import Any
+"""
+CS265 — read-this-first entry point.
+
+Runs the full pipeline on the small DummyModel:
+
+    trace -> profile -> visualise -> select -> rewrite -> re-profile
+
+The whole flow fits on one screen so you can see how the pieces connect.
+"""
 
 import torch
-import torch.fx as fx
-import torch.nn as nn
 
-from graph_prof import GraphProfiler
-from graph_tracer import SEPFunction, compile
-from visualizer import MemoryVisualizer
-from activation_checkpoint import select_activations_to_recompute, print_ac_decisions
-
-
-class DummyModel(nn.Module):
-    def __init__(self, layers: int, dim: int):
-        super().__init__()
-        modules = []
-        for _ in range(layers):
-            modules.extend([nn.Linear(dim, dim), nn.ReLU()])
-        self.mod = nn.Sequential(*modules)
-
-    def forward(self, x):
-        return self.mod(x)
-
-def train_step(model: nn.Module, optim: torch.optim.Optimizer, batch: torch.Tensor,):
-    loss = model(batch).sum()
-    loss = SEPFunction.apply(loss) # so that the compiled FX graph contains explicit separator nodes
-    loss.backward()
-    optim.step()
-    optim.zero_grad()
+from models             import make_dummy, init_optimizer_state
+from graph_tracer       import compile
+from graph_prof         import GraphProfiler
+from visualizer         import plot_memory_breakdown
+from activation_checkpoint import (
+    select_activations, rewrite_with_checkpointing, print_ac_decisions,
+)
 
 
-def graph_transformation(gm: fx.GraphModule, args: Any) -> fx.GraphModule:
+def graph_transformation(gm, args):
+    """Callback invoked once on the freshly-traced GraphModule.
+
+    1. Run a few warm-up + measurement iterations through the profiler.
+    2. Print stats and save the memory breakdown chart.
+    3. Run the µ-TWO selection to decide which activations to recompute.
+    4. Rewrite the graph to recompute them.  Return the rewritten graph.
+    """
     profiler = GraphProfiler(gm)
-    warm_up_iters, profile_iters = 2, 3
-
     with torch.no_grad():
-        for _ in range(warm_up_iters):
+        for _ in range(2):  # warm-up
             profiler.run(*args)
         profiler.reset_stats()
-        for _ in range(profile_iters):
+        for _ in range(3):  # measurement
             profiler.run(*args)
-
     profiler.aggregate_stats()
     profiler.print_stats()
-    viz = MemoryVisualizer(profiler)
-    viz.plot_memory_timeline("memory_breakdown.png")
 
-    to_recompute, to_retain = select_activations_to_recompute(profiler)
-    print_ac_decisions(profiler, to_recompute, to_retain)
+    plot_memory_breakdown(profiler, "memory_breakdown.png",
+                          title="DummyModel — Memory Breakdown")
 
-    # !!! Phase 3 (graph rewriting) will be added here later. !!!
-    return gm
+    selection = select_activations(profiler)
+    print_ac_decisions(profiler, selection)
 
-def experiment():
-    logging.getLogger().setLevel(logging.DEBUG)
+    return rewrite_with_checkpointing(gm, profiler, selection.to_recompute)
+
+
+def main():
     torch.manual_seed(20)
+    model, optim, example_inputs, train_step = make_dummy(
+        batch_size=1000, layers=10, dim=100,
+    )
+    init_optimizer_state(model, optim)
 
-    batch_size = 1000
-    layers = 10
-    dim = 100
-    num_iters = 5
-    device_str = "cuda:0"
+    compiled = compile(train_step, graph_transformation)
+    compiled(model, optim, example_inputs)            # first call traces + transforms
+    for _ in range(4):
+        compiled(model, optim, example_inputs)        # subsequent calls run rewritten gm
 
-    model = DummyModel(dim=dim, layers=layers).to(device_str)
-    batch = torch.randn(batch_size, dim).to(device_str)
+    print("starter_code: done.")
 
-    # foreach = True =>  Instead of updating parameters one at a time, batch all parameters into lists and process them with _foreach_* operations
-    # The downside is that the optimizer step becomes hundreds of small FX nodes instead of one _fused_adam node.
-    # capturable=True => Makes Adam's internals traceable by FX
-    optim = torch.optim.Adam(model.parameters(), lr=0.01, foreach=True, capturable=True)
 
-    # Initialize optimizer state so that it is present when the graph is traced.
-    for param in model.parameters():
-        if param.requires_grad:
-            param.grad = torch.rand_like(param, device=device_str)
-    optim.step()
-    optim.zero_grad()
-
-    compiled_fn = compile(train_step, graph_transformation)
-    compiled_fn(model, optim, batch)
-
-    for _ in range(num_iters - 1):
-        compiled_fn(model, optim, batch)
-
-    print("Experiment completed successfully.")
-    
 if __name__ == "__main__":
-    experiment()
+    main()

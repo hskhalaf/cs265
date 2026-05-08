@@ -1,233 +1,184 @@
 """
-Benchmark harness for profiling real models.
+Deliverable harness.
+
+For each model in MODELS_TO_SWEEP and each batch size, measures peak memory
+and iteration latency once with activation checkpointing off and once with
+it on.  Saves two grouped-bar plots per model under ``plots/``:
+
+    plots/peak_<model>.png      peak memory   vs batch size, AC off vs on
+    plots/latency_<model>.png   iter latency  vs batch size, AC off vs on
 
 Usage:
-    python benchmarks.py                    # default: ResNet18
-    python benchmarks.py Resnet50           # specify model
-    python benchmarks.py Transformer        # Transformer model
-    python benchmarks.py Bert               # BERT model (requires: pip install transformers)
+    python benchmarks.py                # full sweep
+    python benchmarks.py resnet18       # one model only
+    python benchmarks.py --quick        # smaller batch ranges (smoke test)
 """
 
+from __future__ import annotations
+
+import gc
+import os
 import sys
-from typing import Any, Dict, List
+import time
+from typing import List, Tuple
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-import torch.fx as fx
-from torch.testing._internal.distributed._tensor.common_dtensor import (
-    ModelArgs,
-    Transformer,
-)
-from torchvision.models import resnet18, resnet50
-from graph_prof import GraphProfiler
-from graph_tracer import SEPFunction, compile
-from visualizer import MemoryVisualizer
-from activation_checkpoint import (
-    select_activations_to_recompute,
-    print_ac_decisions,
-)
+
+from models                import MODELS, init_optimizer_state
+from graph_tracer          import compile
+from graph_prof            import GraphProfiler
+from visualizer            import plot_peak_memory_vs_batch, plot_latency_vs_batch
+from activation_checkpoint import select_activations, rewrite_with_checkpointing
 
 
-model_names: List[str] = [
-    "Transformer",
-    "Resnet18",
-    "Resnet50",
-    "Bert",
-]
+MODELS_TO_SWEEP: List[str] = ["resnet18", "resnet50", "bert"]
 
-model_batch_sizes: Dict[str, int] = {
-    "Transformer": 4,
-    "Resnet18": 16,
-    "Resnet50": 16,
-    "Bert": 4,
+BATCH_SIZES = {
+    "dummy":    [256, 512, 1000, 2000],
+    "resnet18": [8,   16,  32,   64],
+    "resnet50": [4,   8,   16,   32],
+    "bert":     [2,   4,   8,    16],
 }
 
+QUICK_BATCH_SIZES = {
+    "dummy":    [256, 512],
+    "resnet18": [8, 16],
+    "resnet50": [4, 8],
+    "bert":     [2, 4],
+}
 
-class Experiment:
-    """Benchmark harness for a single model.  Handles model creation, optimizer
-    setup, training step definition, and the graph transformation callback that
-    runs the profiler and AC selection."""
+WARM_UP_ITERS    = 2
+MEASURE_ITERS    = 5
+PLOTS_DIR        = "plots"
 
-    def __init__(self, model_name: str, batch_size: int):
-        assert model_name in model_names, (
-            f"Model {model_name} not found in {model_names}"
-        )
-        dev = torch.device("cuda")
-        self.model_name = model_name
-        self.batch_size = batch_size
 
-        if self.model_name == "Transformer":
-            vocab_size = 2048
-            bsz, seq_len = self.batch_size, 256
-            with torch.device(dev):
-                model_args = ModelArgs(
-                    n_layers=8,
-                    n_heads=4,
-                    vocab_size=vocab_size,
-                    max_seq_len=seq_len,
-                    dropout_p=0.1,
-                )
-                self.model = Transformer(model_args)
-            src = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
-            tgt = torch.randint(0, vocab_size, (bsz, seq_len), device=dev)
-            self.example_inputs = (src, tgt)
+# --------------------------------------------------------------------------- #
+# Single (model, batch_size, ac) measurement                                  #
+# --------------------------------------------------------------------------- #
 
-            def transformer_train_step(
-                model: nn.Module, optim: optim.Optimizer, example_inputs: Any,
-            ):
-                loss = self.loss_fn(model(example_inputs[0]), example_inputs[1])
-                loss = SEPFunction.apply(loss)
-                loss.backward()
-                optim.step()
-                optim.zero_grad()
 
-            self.train_step = transformer_train_step
-            self.optimizer = optim.Adam(
-                self.model.parameters(), lr=1e-2,
-                foreach=True, capturable=True,
-            )
+def run_one(model_name: str, batch_size: int, ac: bool) -> Tuple[float, float]:
+    """Build, compile, run, and return ``(peak_mb, latency_ms)``."""
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.manual_seed(0)
 
-        elif self.model_name in ["Resnet18", "Resnet50"]:
-            inp = torch.randn(self.batch_size, 3, 224, 224, device=dev)
-            num_classes = 10
-            target = torch.randint(0, num_classes, (self.batch_size,), device=dev)
-            self.example_inputs = (inp, target)
-            with torch.device(dev):
-                self.model = (
-                    resnet18() if self.model_name == "Resnet18" else resnet50()
-                )
+    model, optim, inputs, train_step = MODELS[model_name](batch_size=batch_size)
+    init_optimizer_state(model, optim)
 
-            def resnet_train_step(
-                model: nn.Module, optim: optim.Optimizer, example_inputs: Any,
-            ):
-                loss = self.loss_fn(model(example_inputs[0]), example_inputs[1])
-                loss = SEPFunction.apply(loss)
-                loss.backward()
-                optim.step()
-                optim.zero_grad()
-
-            self.optimizer = optim.Adam(
-                self.model.parameters(), lr=1e-2,
-                foreach=True, capturable=True,
-            )
-            self.train_step = resnet_train_step
-
-        elif self.model_name == "Bert":
-            from transformers import BertConfig, BertForSequenceClassification
-
-            num_classes = 2
-            seq_len = 128
-            config = BertConfig(
-                vocab_size=30522,
-                hidden_size=768,
-                num_hidden_layers=12,
-                num_attention_heads=12,
-                intermediate_size=3072,
-                max_position_embeddings=512,
-                num_labels=num_classes,
-                # Disable features that break FX tracing.
-                torchscript=True,
-            )
-            self.model = BertForSequenceClassification(config).to(dev)
-
-            input_ids = torch.randint(
-                0, config.vocab_size, (self.batch_size, seq_len), device=dev,
-            )
-            attention_mask = torch.ones(
-                self.batch_size, seq_len, dtype=torch.long, device=dev,
-            )
-            labels = torch.randint(
-                0, num_classes, (self.batch_size,), device=dev,
-            )
-            self.example_inputs = (input_ids, attention_mask, labels)
-
-            def bert_train_step(
-                model: nn.Module, optim: optim.Optimizer, example_inputs: Any,
-            ):
-                input_ids, attention_mask, labels = (
-                    example_inputs[0],
-                    example_inputs[1],
-                    example_inputs[2],
-                )
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )
-                loss = outputs.loss
-                loss = SEPFunction.apply(loss)
-                loss.backward()
-                optim.step()
-                optim.zero_grad()
-
-            self.optimizer = optim.Adam(
-                self.model.parameters(), lr=1e-2,
-                foreach=True, capturable=True,
-            )
-            self.train_step = bert_train_step
-
-    def loss_fn(self, logits: torch.Tensor, targets: torch.Tensor):
-        return F.cross_entropy(
-            logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1,
-        )
-
-    def init_opt_states(self) -> None:
-        """Run one dummy optimizer step to initialise Adam's lazy state."""
-        for param in self.model.parameters():
-            if param.requires_grad:
-                param.grad = torch.rand_like(param)
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-
-    def graph_transformation(
-        self, gm: fx.GraphModule, args: Any,
-    ) -> fx.GraphModule:
-        print(f"\n{'=' * 80}")
-        print(f"PROFILING: {self.model_name} (batch_size={self.batch_size})")
-        print(f"{'=' * 80}")
-
+    def transform(gm, args):
         profiler = GraphProfiler(gm)
-        warm_up_iters, profile_iters = 2, 3
-
         with torch.no_grad():
-            for _ in range(warm_up_iters):
+            for _ in range(WARM_UP_ITERS):
                 profiler.run(*args)
             profiler.reset_stats()
-            for _ in range(profile_iters):
+            for _ in range(MEASURE_ITERS):
                 profiler.run(*args)
-
         profiler.aggregate_stats()
-        profiler.print_stats()
-
-        # Memory breakdown chart.
-        chart_name = f"memory_{self.model_name.lower()}.png"
-        viz = MemoryVisualizer(profiler)
-        viz.plot_memory_timeline(
-            chart_name,
-            title=f"Memory Breakdown — {self.model_name} (bs={self.batch_size})",
-        )
-
-        # AC selection.
-        to_recompute, to_retain = select_activations_to_recompute(profiler)
-        print_ac_decisions(profiler, to_recompute, to_retain)
-
+        if ac:
+            selection = select_activations(profiler)
+            return rewrite_with_checkpointing(
+                gm, profiler, selection.to_recompute,
+            )
         return gm
 
-    def run(self) -> None:
-        """Initialise optimizer state, compile, and run the full pipeline."""
-        self.init_opt_states()
-        compiled_fn = compile(self.train_step, self.graph_transformation)
-        compiled_fn(self.model, self.optimizer, self.example_inputs)
-        print(f"{self.model_name} completed successfully.")
+    compiled = compile(train_step, transform)
+
+    # First call traces + (optionally) rewrites the graph.
+    compiled(model, optim, inputs)
+
+    # Warm up the (possibly rewritten) graph before measuring.
+    for _ in range(WARM_UP_ITERS):
+        compiled(model, optim, inputs)
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    for _ in range(MEASURE_ITERS):
+        compiled(model, optim, inputs)
+    torch.cuda.synchronize()
+    elapsed_s = time.perf_counter() - t0
+
+    peak_mb    = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    latency_ms = (elapsed_s / MEASURE_ITERS) * 1000.0
+
+    # Free everything before the next configuration.
+    del model, optim, inputs, train_step, compiled
+    torch.cuda.empty_cache()
+    gc.collect()
+    return peak_mb, latency_ms
+
+
+# --------------------------------------------------------------------------- #
+# Sweep                                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def sweep_model(model_name: str, batch_sizes: List[int]) -> List[dict]:
+    """Returns one dict per batch size with both AC-off and AC-on numbers."""
+    rows: List[dict] = []
+    for bs in batch_sizes:
+        print(f"\n--- {model_name}  bs={bs} ---")
+        try:
+            off_mb, off_ms = run_one(model_name, bs, ac=False)
+            print(f"  AC off : peak={off_mb:7.1f} MB  latency={off_ms:7.2f} ms")
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"  AC off : OOM ({e})")
+            off_mb, off_ms = float("nan"), float("nan")
+
+        try:
+            on_mb, on_ms = run_one(model_name, bs, ac=True)
+            print(f"  AC on  : peak={on_mb:7.1f} MB  latency={on_ms:7.2f} ms")
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"  AC on  : OOM ({e})")
+            on_mb, on_ms = float("nan"), float("nan")
+
+        rows.append({
+            "batch_size": bs,
+            "ac_off_peak_mb":  off_mb,
+            "ac_on_peak_mb":   on_mb,
+            "ac_off_lat_ms":   off_ms,
+            "ac_on_lat_ms":    on_ms,
+        })
+    return rows
+
+
+def main():
+    if not torch.cuda.is_available():
+        print("CUDA unavailable; benchmarks need a GPU.")
+        sys.exit(1)
+
+    quick = "--quick" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--quick"]
+    models = args or MODELS_TO_SWEEP
+    batch_table = QUICK_BATCH_SIZES if quick else BATCH_SIZES
+
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+
+    for model_name in models:
+        bsizes = batch_table.get(model_name, [4, 8, 16])
+        rows = sweep_model(model_name, bsizes)
+
+        peak_rows = [{"batch_size": r["batch_size"],
+                      "ac_off": r["ac_off_peak_mb"],
+                      "ac_on":  r["ac_on_peak_mb"]} for r in rows]
+        lat_rows  = [{"batch_size": r["batch_size"],
+                      "ac_off": r["ac_off_lat_ms"],
+                      "ac_on":  r["ac_on_lat_ms"]}  for r in rows]
+
+        plot_peak_memory_vs_batch(
+            peak_rows,
+            f"{PLOTS_DIR}/peak_{model_name}.png",
+            f"Peak Memory — {model_name}",
+        )
+        plot_latency_vs_batch(
+            lat_rows,
+            f"{PLOTS_DIR}/latency_{model_name}.png",
+            f"Iteration Latency — {model_name}",
+        )
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
-    # Accept model name as command-line argument, default to Resnet18.
-    name = sys.argv[1] if len(sys.argv) > 1 else "Resnet18"
-    if name not in model_names:
-        print(f"Unknown model '{name}'. Choose from: {model_names}")
-        sys.exit(1)
-    exp = Experiment(name, model_batch_sizes[name])
-    exp.run()
+    main()
