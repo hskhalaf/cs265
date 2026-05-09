@@ -30,14 +30,15 @@ from graph_prof     import GraphProfiler, NodeType
 from visualizer     import plot_memory_breakdown
 
 
-PLOTS_DIR = "plots"
-LOGS_DIR  = "logs"
+PLOTS_DIR     = "plots"
+LOGS_DIR      = "logs"
+SNAPSHOTS_DIR = "snapshots"
 
 # Batch sizes to sweep per model.  Override with `-b 8 16 32` on the CLI.
 DEFAULT_BATCH_SIZES = [4, 8, 32]
 
 
-def profile_model(name: str, batch_size: int) -> None:
+def profile_model(name: str, batch_size: int, snapshot: bool = False) -> None:
     print(f"\n{'=' * 70}\nPHASE 1: {name}  (batch_size={batch_size})\n{'=' * 70}")
 
     torch.manual_seed(0)
@@ -58,8 +59,17 @@ def profile_model(name: str, batch_size: int) -> None:
 
         # ---- three peak numbers, computed on a fresh measurement run ----
         torch.cuda.reset_peak_memory_stats()
+        if snapshot:
+            torch.cuda.memory._record_memory_history(max_entries=200_000)
         with torch.no_grad():
             gm(*args)
+        if snapshot:
+            os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+            snap_path = f"{SNAPSHOTS_DIR}/{name}_bs{batch_size}.pickle"
+            torch.cuda.memory._dump_snapshot(snap_path)
+            torch.cuda.memory._record_memory_history(enabled=None)
+            print(f"  Snapshot:  {snap_path}"
+                  f"  (load at https://pytorch.org/memory_viz)")
         allocated = torch.cuda.max_memory_allocated()   # peak live tensor bytes
         reserved  = torch.cuda.max_memory_reserved()    # peak allocator-pool bytes
         estimated = profiler.peak_memory_bytes()        # our FX-only static walk
@@ -115,6 +125,11 @@ def main():
                    default=DEFAULT_BATCH_SIZES,
                    help=f"batch sizes to sweep for each model "
                         f"(default: {DEFAULT_BATCH_SIZES}).")
+    p.add_argument("--snapshot", action="store_true",
+                   help="record a CUDA memory snapshot per (model, batch) "
+                        "and save to snapshots/<model>_bs<N>.pickle. "
+                        "Load at https://pytorch.org/memory_viz to inspect "
+                        "every allocation and its stack trace.")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -128,7 +143,7 @@ def main():
             continue
         for bs in args.batch_sizes:
             try:
-                profile_model(name, bs)
+                profile_model(name, bs, snapshot=args.snapshot)
             except torch.cuda.OutOfMemoryError as e:
                 print(f"  [OOM] {name} bs={bs}: {e}")
                 torch.cuda.empty_cache()
