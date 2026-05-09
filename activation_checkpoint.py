@@ -171,8 +171,17 @@ def select_activations(profiler: GraphProfiler,mem_limit: Optional[int] = None) 
     remaining = set(all_acts)
     reason = "memory target reached"
 
+    # Strict Algorithm E never bails on bad picks, so we track the best
+    # prefix we passed through and roll back to it at the end — this
+    # protects against a pathological tail where late picks raise peak.
+    best_peak = peak_before
+    best_n = 0
+
     while remaining:
-        if simulate_peak(profiler, evicted) <= mem_limit:
+        peak = simulate_peak(profiler, evicted)
+        if peak < best_peak:
+            best_peak, best_n = peak, len(order)
+        if peak <= mem_limit:
             break
 
         retained = all_acts - evicted
@@ -195,11 +204,21 @@ def select_activations(profiler: GraphProfiler,mem_limit: Optional[int] = None) 
     else:
         reason = "all candidates exhausted"
 
+    final_peak = simulate_peak(profiler, evicted)
+    if final_peak < best_peak:
+        best_peak, best_n = final_peak, len(order)
+
+    order = order[:best_n]
     to_recompute, to_retain = validate_recompute_set(profiler, order)
     peak_after = simulate_peak(profiler, to_recompute)
-    dropped = len(order) - len(to_recompute)
-    if dropped > 0 and peak_after > mem_limit:
-        reason = f"validator dropped {dropped} picks; target not reached"
+    if peak_after <= mem_limit:
+        reason = "memory target reached"
+    elif len(to_recompute) < len(order):
+        reason = f"validator dropped {len(order) - len(to_recompute)} picks; best peak {peak_after / 1024**2:.1f} MB"
+    elif peak_after < peak_before:
+        reason = f"best achievable peak {peak_after / 1024**2:.1f} MB"
+    else:
+        reason = "no eviction lowers peak"
     return SelectionResult(to_recompute, to_retain, peak_before, peak_after, mem_limit, estimate_recompute_ms(profiler, to_recompute), reason)
 
 
