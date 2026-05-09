@@ -73,7 +73,16 @@ def _simulate_peak(profiler: GraphProfiler, evicted: Set[fx.Node]) -> int:
         size = profiler.node_size_bytes.get(owner, 0)
         if size == 0:
             continue
-        produced = 0 if owner.op == OP.PLACEHOLDER else profiler.idx[owner]
+
+        # Placeholders are the steady-state baseline (params, optimizer
+        # state, batched inputs).  They live for the whole iteration and
+        # cannot be evicted — they aren't intermediate activations.
+        if owner.op == OP.PLACEHOLDER:
+            for t in range(n):
+                timeline[t] += size
+            continue
+
+        produced = profiler.idx[owner]
         evicted_aliases = [a for a in aliases if a in evicted]
 
         retained_backward_use = any(

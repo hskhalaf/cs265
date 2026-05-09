@@ -35,7 +35,7 @@ LOGS_DIR      = "logs"
 SNAPSHOTS_DIR = "snapshots"
 
 # Batch sizes to sweep per model.  Override with `-b 8 16 32` on the CLI.
-DEFAULT_BATCH_SIZES = [4, 8, 32]
+DEFAULT_BATCH_SIZES = [4, 8, 16, 32]
 
 
 def profile_model(name: str, batch_size: int,

@@ -21,18 +21,28 @@ and ``visualizer.plot_memory_breakdown`` (Phase 1 plots).
 
 Why the storage-aware sizing matters
 ------------------------------------
-Adam with ``foreach=True`` decomposes the optimizer step into ``_foreach_*``
-ops whose output list elements *alias* the input parameters in-place.  A
-naive size walk that counts both the input params and the foreach output
-double-counts the parameters and produces a fake "spike" in the memory chart
-at the optimizer step.  We avoid this by checking each op's schema: if any
-return value aliases any argument, the op contributes 0 new bytes.
+Three FX patterns share a single underlying GPU allocation but appear as
+distinct nodes in the graph:
+
+* in-place / view ops marked by their schema's ``alias_info`` (``relu_``,
+  ``view``, ``transpose``, ``_foreach_add_``, ``_fused_adam``);
+* multi-output ops whose result is a list/tuple, unpacked via
+  ``operator.getitem`` (``aten._foreach_div`` followed by 62 getitems on
+  ResNet18, or ``aten.split`` followed by getitems on its slices);
+* placeholders that hold steady-state buffers (model parameters, Adam
+  moments) and persist across iterations.
+
+``_compute_aliases`` collapses each of these into a single *storage owner*,
+and ``memory_timeline_by_role`` walks by owner so the bytes are counted
+exactly once.  Placeholders are special-cased to be live for the whole
+iteration since they exist before step 0 and after step N-1.
 """
 
 from __future__ import annotations
 
+import operator
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Set
 
@@ -120,16 +130,28 @@ def _output_alias_targets_inputs(node: fx.Node) -> bool:
     return False
 
 
-def _single_output_aliases_input(node: fx.Node) -> bool:
-    """True for single-tensor outputs that alias an input storage."""
-    target = node.target
-    schema = getattr(target, "_schema", None)
-    if schema is None or len(schema.returns) != 1:
+def _is_getitem(node: fx.Node) -> bool:
+    return (
+        node.op == OP.CALL_FUNCTION
+        and (
+            node.target is operator.getitem
+            or getattr(node.target, "__name__", None) == "getitem"
+        )
+    )
+
+
+def _is_tensor_container_output(node: fx.Node) -> bool:
+    val = node.meta.get("val")
+    return (
+        isinstance(val, (list, tuple))
+        and next(_iter_tensors(val), None) is not None
+    )
+
+
+def _is_getitem_of_tensor_container(node: fx.Node) -> bool:
+    if not _is_getitem(node) or not node.all_input_nodes:
         return False
-    ret = schema.returns[0]
-    if ret.alias_info is None:
-        return False
-    return isinstance(node.meta.get("val"), torch.Tensor)
+    return _is_tensor_container_output(node.all_input_nodes[0])
 
 
 def _node_output_bytes(node: fx.Node) -> int:
@@ -147,6 +169,11 @@ def _node_allocation_bytes(node: fx.Node) -> int:
     allocate new storage.  Their users are accounted for by extending the
     lifetime of the original storage owner.
     """
+    if _is_getitem_of_tensor_container(node):
+        # ``getitem`` on a list/tuple is pure reference — no allocation.
+        # The parent container is the storage owner regardless of whether
+        # its outputs are independent (foreach_div) or views (aten.split).
+        return 0
     if node.op == OP.CALL_FUNCTION and _output_alias_targets_inputs(node):
         return 0
     return _node_output_bytes(node)
@@ -313,13 +340,30 @@ class GraphProfiler(fx.Interpreter):
             inter.size_bytes = self.node_logical_size_bytes[inter.node]
 
     def _compute_aliases(self) -> None:
-        """Map alias/view/in-place nodes to the node that owns their storage."""
+        """Map alias/view/in-place nodes to the node that owns their storage.
+
+        Three categories chain through to a parent owner:
+          * ``getitem(container, i)`` — owner = the container's owner.
+          * single-output alias ops (``view``, ``relu_``, ...) — owner = first
+            sized input's owner.
+          * **multi-output in-place ops** (``_foreach_mul_``, ``_fused_adam``,
+            ``aten.split``) — same rule as single-output.  Their schema marks
+            returns as aliasing inputs but our older check skipped them
+            because the output is a list/tuple instead of a single Tensor;
+            without this, a chain like ``denom = _foreach_sqrt(v)`` →
+            ``_foreach_mul_(denom, ...)`` → ``_foreach_addcdiv_`` would treat
+            each in-place step as starting a fresh allocation, double-
+            counting the optimizer scratch buffer at every step in the chain.
+        """
         self.storage_owner: Dict[fx.Node, fx.Node] = {}
         self.aliases_by_owner: Dict[fx.Node, List[fx.Node]] = defaultdict(list)
 
         for n in self.nodes:
             owner = n
-            if n.op == OP.CALL_FUNCTION and _single_output_aliases_input(n):
+            if _is_getitem_of_tensor_container(n):
+                parent = n.all_input_nodes[0]
+                owner = self.storage_owner.get(parent, parent)
+            elif n.op == OP.CALL_FUNCTION and _output_alias_targets_inputs(n):
                 for inp in n.all_input_nodes:
                     if self.node_logical_size_bytes.get(inp, 0) > 0:
                         owner = self.storage_owner.get(inp, inp)
