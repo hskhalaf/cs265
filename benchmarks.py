@@ -55,7 +55,7 @@ model_batch_sizes: Dict[str, List[int]] = {
     "bert":     [4, 8, 16, 32],
 }
 
-WARMUP_ITERS, MEASURE_ITERS = 2, 3
+WARMUP_ITERS, MEASURE_ITERS = 2, 5
 
 
 class Experiment:
