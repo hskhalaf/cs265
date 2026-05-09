@@ -33,6 +33,7 @@ from visualizer   import plot_memory_breakdown, plot_peak_vs_batch
 
 
 PLOTS_DIR = "plots"
+LOGS_DIR = "logs"
 DEFAULT_BATCH_SIZES = [4, 8, 16, 32]
 
 
@@ -70,6 +71,14 @@ def profile_model(name: str, batch_size: int) -> dict:
         })
 
         profiler.print_summary()
+
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        log_path = f"{LOGS_DIR}/{name}_bs{batch_size}.txt"
+        json_path = f"{LOGS_DIR}/{name}_bs{batch_size}.json"
+        profiler.write_full_log(log_path)
+        profiler.write_json_log(json_path)
+        print(f"  Full log:  {log_path}")
+        print(f"  JSON:      {json_path}")
 
         os.makedirs(PLOTS_DIR, exist_ok=True)
         plot_path = f"{PLOTS_DIR}/memory_{name}_bs{batch_size}.png"

@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 import torch.fx as fx
 
-from graph_prof import GraphProfiler, OP
+from graph_prof import GraphProfiler
 
 
 # --------------------------------------------------------------------------- #
@@ -77,7 +77,7 @@ def _simulate_peak(profiler: GraphProfiler, evicted: Set[fx.Node]) -> int:
         # Placeholders are the steady-state baseline (params, optimizer
         # state, batched inputs).  They live for the whole iteration and
         # cannot be evicted — they aren't intermediate activations.
-        if owner.op == OP.PLACEHOLDER:
+        if owner.op == "placeholder":
             for t in range(n):
                 timeline[t] += size
             continue
@@ -189,7 +189,7 @@ def select_activations(profiler: GraphProfiler,
 
     to_recompute, to_retain = _validate_recompute_set(
         order, [i.node for i in inters if i.node not in evicted],
-        placeholders={n for n in profiler.nodes if n.op == OP.PLACEHOLDER},
+        placeholders={n for n in profiler.nodes if n.op == "placeholder"},
     )
     peak_after = _simulate_peak(profiler, set(to_recompute))
     return SelectionResult(to_recompute, to_retain, peak_before, peak_after)
@@ -256,7 +256,7 @@ def rewrite_with_checkpointing(gm: fx.GraphModule,
     if not to_recompute:
         return gm
 
-    placeholders  = {n for n in gm.graph.nodes if n.op == OP.PLACEHOLDER}
+    placeholders  = {n for n in gm.graph.nodes if n.op == "placeholder"}
     recompute_set = set(to_recompute)
     retain_set    = {i.node for i in profiler.intermediates
                      if i.node not in recompute_set}

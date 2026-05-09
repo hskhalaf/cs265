@@ -22,6 +22,7 @@ from graph_prof import GraphProfiler, NodeType
 # Colour palette — same role, same colour, everywhere.
 _ROLE_COLOR: Dict[NodeType, str] = {
     NodeType.PARAM: "#4C72B0",   # blue
+    NodeType.OPT_STATE: "#8172B3",  # purple
     NodeType.ACT:   "#55A868",   # green
     NodeType.GRAD:  "#DD8452",   # orange
     NodeType.OTHER: "#999999",   # gray
@@ -30,6 +31,7 @@ _ROLE_COLOR: Dict[NodeType, str] = {
 # Stack order, bottom to top.
 _STACK_ORDER: Tuple[NodeType, ...] = (
     NodeType.PARAM,
+    NodeType.OPT_STATE,
     NodeType.OTHER,
     NodeType.ACT,
     NodeType.GRAD,
