@@ -165,18 +165,52 @@ def _node_output_bytes(node: fx.Node) -> int:
 def _node_allocation_bytes(node: fx.Node) -> int:
     """Bytes of new storage allocated by this node.
 
-    Alias/view/in-place nodes have logical tensor sizes, but they do not
-    allocate new storage.  Their users are accounted for by extending the
-    lifetime of the original storage owner.
+    Three cases for multi-output ops:
+      * **Aliasing** (``aten.split``, ``_foreach_mul_``): parent and getitems
+        all contribute 0; storage chain links back to the inputs.
+      * **Independent + only-getitem users** (``conv_backward``,
+        ``cudnn_batch_norm``): bytes are attributed to each getitem
+        individually so per-element role attribution (GRAD vs OTHER) works.
+      * **Independent + mixed users**: parent owns full bytes (rare).
     """
     if _is_getitem_of_tensor_container(node):
-        # ``getitem`` on a list/tuple is pure reference — no allocation.
-        # The parent container is the storage owner regardless of whether
-        # its outputs are independent (foreach_div) or views (aten.split).
-        return 0
+        parent = node.all_input_nodes[0]
+        if (parent.op == OP.CALL_FUNCTION
+                and _output_alias_targets_inputs(parent)):
+            return 0  # view of parent's input
+        return _node_output_bytes(node)  # owns one element of independent output
     if node.op == OP.CALL_FUNCTION and _output_alias_targets_inputs(node):
         return 0
+    if (node.op == OP.CALL_FUNCTION
+            and _is_tensor_container_output(node)
+            and all(_is_getitem(u) for u in node.users)):
+        return 0  # bytes are on the getitems
     return _node_output_bytes(node)
+
+
+def _alias_target_for_getitem(parent: fx.Node,
+                               getitem: fx.Node) -> Optional[fx.Node]:
+    """For ``getitem(parent, i)`` where parent's outputs alias parent's
+    inputs, return the input node whose storage corresponds to ``output[i]``.
+
+    Two patterns:
+      * Single-input multi-output (``aten.split``, ``unbind``, ``chunk``):
+        all outputs view the same input.
+      * List-input multi-output in-place (``_foreach_mul_(a_list, ...)``):
+        ``output[i]`` aliases ``a_list[i]``.
+    """
+    if len(getitem.args) < 2 or not parent.args:
+        return None
+    idx = getitem.args[1]
+    first = parent.args[0]
+    if isinstance(first, fx.Node):
+        return first
+    if (isinstance(first, (list, tuple))
+            and isinstance(idx, int)
+            and 0 <= idx < len(first)
+            and isinstance(first[idx], fx.Node)):
+        return first[idx]
+    return None
 
 
 _ROLE_PRIORITY: Dict[NodeType, int] = {
@@ -362,7 +396,18 @@ class GraphProfiler(fx.Interpreter):
             owner = n
             if _is_getitem_of_tensor_container(n):
                 parent = n.all_input_nodes[0]
-                owner = self.storage_owner.get(parent, parent)
+                if (parent.op == OP.CALL_FUNCTION
+                        and _output_alias_targets_inputs(parent)):
+                    # Aliasing parent: chain to the input element this
+                    # getitem corresponds to (split → input; foreach in-place
+                    # → input list[i]).
+                    target = _alias_target_for_getitem(parent, n)
+                    if (target is not None
+                            and self.node_logical_size_bytes.get(target, 0) > 0):
+                        owner = self.storage_owner.get(target, target)
+                # Independent multi-output (conv_backward etc.): leave the
+                # getitem as its own owner so per-element role attribution
+                # (GRAD vs OTHER) is preserved.
             elif n.op == OP.CALL_FUNCTION and _output_alias_targets_inputs(n):
                 for inp in n.all_input_nodes:
                     if self.node_logical_size_bytes.get(inp, 0) > 0:
