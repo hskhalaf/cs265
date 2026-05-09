@@ -66,7 +66,13 @@ def simulate_timeline_by_role(profiler: GraphProfiler, evicted: Iterable[fx.Node
                 timeline[role][t] += size
             continue
         # Drop the backward window only when every retained alias is forward-only.
-        fwd_only = (any(a in evicted for a in aliases)  and all(a in evicted or all( profiler.idx[u] < profiler.sep_bwd_idx for u in a.users if u in profiler.idx) for a in aliases))
+        fwd_only = any(a in evicted for a in aliases) and all(
+            a in evicted or all(
+                profiler.idx[u] < profiler.sep_bwd_idx
+                for u in a.users if u in profiler.idx
+            )
+            for a in aliases
+        )
 
         last = profiler.idx[owner]
         for alias in aliases:
@@ -81,7 +87,6 @@ def simulate_timeline_by_role(profiler: GraphProfiler, evicted: Iterable[fx.Node
 
     if not evicted:
         return timeline
-
 
     retained = {i.node for i in profiler.intermediates} - evicted
     for act in evicted:
@@ -116,8 +121,6 @@ def validate_recompute_set(profiler: GraphProfiler, selected_order: List[fx.Node
     selected = set(selected_order)
 
     def mutates_boundary(n: fx.Node, body_set: Set[fx.Node]) -> bool:
-        # In-place op is OK iff its mutated input is a body-internal copy;
-        # writing to a placeholder/retained tensor is what corrupts state.
         schema = getattr(n.target, "_schema", None)
         if schema is None:
             return False
@@ -177,6 +180,19 @@ def select_activations(profiler: GraphProfiler,mem_limit: Optional[int] = None) 
     best_peak = peak_before
     best_n = 0
 
+    # Body cost only changes for an act when one of its forward-graph
+    # ancestors is evicted. Precompute descendants once, cache the cost,
+    # invalidate descendants of each pick.
+    descendants = {a: _forward_descendants(a, all_acts) for a in all_acts}
+    cost_cache: Dict[fx.Node, float] = {}
+
+    def cost_of(n: fx.Node) -> float:
+        if n not in cost_cache:
+            body = recompute_body(profiler, n, all_acts - evicted - {n})
+            c = body_runtime_ms(profiler, body)
+            cost_cache[n] = c if c > 0 else inter_by_node[n].recompute_ms
+        return cost_cache[n]
+
     while remaining:
         peak = simulate_peak(profiler, evicted)
         if peak < best_peak:
@@ -184,14 +200,11 @@ def select_activations(profiler: GraphProfiler,mem_limit: Optional[int] = None) 
         if peak <= mem_limit:
             break
 
-        retained = all_acts - evicted
         scored = []
         for n in remaining:
-            cost = body_runtime_ms(profiler, recompute_body(profiler, n, retained - {n}))
-            if cost <= 0:
-                cost = inter_by_node[n].recompute_ms
-            if cost > 0:
-                scored.append((inter_by_node[n].size_bytes / cost, n))
+            c = cost_of(n)
+            if c > 0:
+                scored.append((inter_by_node[n].size_bytes / c, n))
 
         if not scored:
             reason = "no candidate has a positive recomputation cost"
@@ -201,6 +214,8 @@ def select_activations(profiler: GraphProfiler,mem_limit: Optional[int] = None) 
         evicted.add(picked)
         order.append(picked)
         remaining.discard(picked)
+        for d in descendants[picked]:
+            cost_cache.pop(d, None)
     else:
         reason = "all candidates exhausted"
 
@@ -220,6 +235,23 @@ def select_activations(profiler: GraphProfiler,mem_limit: Optional[int] = None) 
     else:
         reason = "no eviction lowers peak"
     return SelectionResult(to_recompute, to_retain, peak_before, peak_after, mem_limit, estimate_recompute_ms(profiler, to_recompute), reason)
+
+
+def _forward_descendants(act: fx.Node, all_acts: Set[fx.Node]) -> Set[fx.Node]:
+    """Acts reachable from `act` via forward users — i.e., acts whose body
+    walks back through `act`."""
+    descendants: Set[fx.Node] = set()
+    seen: Set[fx.Node] = set()
+    stack = list(act.users)
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        if n in all_acts:
+            descendants.add(n)
+        stack.extend(n.users)
+    return descendants
 
 
 def first_backward_user(activation: fx.Node, profiler: GraphProfiler) -> Optional[fx.Node]:

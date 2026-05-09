@@ -11,6 +11,11 @@ from models import MODELS, init_optimizer_state
 from visualizer import (plot_latency_comparison_vs_batch, plot_memory_breakdown, plot_peak_memory_vs_batch)
 
 PLOTS_DIR = "plots"
+PROFILER_NO_AC_DIR = f"{PLOTS_DIR}/profiler/no_ac"
+PROFILER_AC_DIR    = f"{PLOTS_DIR}/profiler/ac"
+HISTOGRAMS_DIR     = f"{PLOTS_DIR}/histograms"
+LATENCY_DIR        = f"{PLOTS_DIR}/latency"
+
 model_names: List[str] = ["dummy", "resnet18", "resnet50", "bert"]
 model_batch_sizes: Dict[str, List[int]] = { "dummy": [4, 8, 16, 32], "resnet18": [4, 8, 16, 32], "resnet50": [4, 8, 16, 32], "bert": [4, 8, 16, 32]}
 WARMUP_ITERS, MEASURE_ITERS = 3, 5
@@ -138,10 +143,11 @@ class Experiment:
         return max(diffs) if diffs else 0.0
 
     def _save_breakdown_plot(self, profiler: GraphProfiler, suffix: str) -> None:
-        os.makedirs(PLOTS_DIR, exist_ok=True)
+        out_dir = PROFILER_AC_DIR if suffix == "ac" else PROFILER_NO_AC_DIR
+        os.makedirs(out_dir, exist_ok=True)
         base    = f"{self.model_name}_bs{self.batch_size}"
         title   = ("no AC" if suffix == "no_ac" else "with AC")
-        plot_memory_breakdown(profiler, f"{PLOTS_DIR}/benchmark_memory_{base}_{suffix}.png", title=f"{self.model_name} — Memory Breakdown, {title} (bs={self.batch_size})")
+        plot_memory_breakdown(profiler, f"{out_dir}/{base}.png", title=f"{self.model_name} — Memory Breakdown, {title} (bs={self.batch_size})")
 
     def run(self) -> dict:
         self.init_opt_states()
@@ -181,7 +187,8 @@ def main() -> None:
                 print(f"  [OOM] {name} bs={bs}: {exc}")
                 torch.cuda.empty_cache()
 
-    os.makedirs(PLOTS_DIR, exist_ok=True)
+    os.makedirs(HISTOGRAMS_DIR, exist_ok=True)
+    os.makedirs(LATENCY_DIR, exist_ok=True)
     for name, rows in all_metrics.items():
         if len(rows) < 2:
             continue
@@ -199,13 +206,13 @@ def main() -> None:
         ]
         plot_peak_memory_vs_batch(
             peak_rows,
-            f"{PLOTS_DIR}/benchmark_peak_vs_batch_{name}.png",
-            f"{name} — peak memory vs batch size",
+            f"{HISTOGRAMS_DIR}/{name}.png",
+            f"{name} — peak memory vs batch size (no AC vs AC)",
         )
         plot_latency_comparison_vs_batch(
             latency_rows,
-            f"{PLOTS_DIR}/benchmark_latency_vs_batch_{name}.png",
-            f"{name} — latency vs batch size",
+            f"{LATENCY_DIR}/{name}.png",
+            f"{name} — latency vs batch size (no AC vs AC)",
         )
 
     if any(all_metrics.values()):
@@ -226,7 +233,8 @@ def main() -> None:
                       f" {r['max_output_diff']:>9.2e}")
         print("=" * 96)
 
-    print(f"\nDone. Plots in ./{PLOTS_DIR}/")
+    print(f"\nDone. Plots in ./{PLOTS_DIR}/ "
+          f"({PROFILER_NO_AC_DIR}, {PROFILER_AC_DIR}, {HISTOGRAMS_DIR}, {LATENCY_DIR})")
 
 
 if __name__ == "__main__":
