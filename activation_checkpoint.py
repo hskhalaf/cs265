@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 import torch
 import torch.fx as fx
-from graph_prof import GraphProfiler, NodeType, alias_in_schema
+from graph_prof import GraphProfiler, NodeType, mutates_args
 
 
 @dataclass
@@ -120,7 +120,7 @@ def validate_recompute_set(profiler: GraphProfiler, selected_order: List[fx.Node
         return bool(body) and all(
             n.op in {"call_function", "call_method", "call_module"}
             and profiler.idx[n] < profiler.sep_idx
-            and not (n.op == "call_function" and alias_in_schema(n))
+            and not (n.op == "call_function" and mutates_args(n))
             for n in body
         )
 
@@ -179,7 +179,11 @@ def select_activations(profiler: GraphProfiler,mem_limit: Optional[int] = None) 
         reason = "all candidates exhausted"
 
     to_recompute, to_retain = validate_recompute_set(profiler, order)
-    return SelectionResult(to_recompute, to_retain, peak_before, simulate_peak(profiler, to_recompute), mem_limit, estimate_recompute_ms(profiler, to_recompute), reason)
+    peak_after = simulate_peak(profiler, to_recompute)
+    dropped = len(order) - len(to_recompute)
+    if dropped > 0 and peak_after > mem_limit:
+        reason = f"validator dropped {dropped} picks; target not reached"
+    return SelectionResult(to_recompute, to_retain, peak_before, peak_after, mem_limit, estimate_recompute_ms(profiler, to_recompute), reason)
 
 
 def first_backward_user(activation: fx.Node, profiler: GraphProfiler) -> Optional[fx.Node]:

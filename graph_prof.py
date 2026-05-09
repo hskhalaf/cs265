@@ -69,6 +69,13 @@ def alias_in_schema(node: fx.Node) -> bool:
     schema = getattr(node.target, "_schema", None)
     return schema is not None and any(r.alias_info is not None for r in schema.returns)
 
+def mutates_args(node: fx.Node) -> bool:
+    """Return True when the operator writes to one of its arguments (in-place)."""
+    schema = getattr(node.target, "_schema", None)
+    if schema is None:
+        return False
+    return any(a.alias_info is not None and a.alias_info.is_write for a in schema.arguments)
+
 def is_getitem(node: fx.Node) -> bool:
     """Return True for getitem nodes that unpack multi-output operators."""
     return (node.op == "call_function" and (node.target is operator.getitem or getattr(node.target, "__name__", None) == "getitem"))
