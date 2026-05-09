@@ -232,11 +232,18 @@ def select_activations(profiler: GraphProfiler,
       3. Score every remaining candidate by ``size / body_runtime_ms``,
          where the body is computed against the current retained set.
       4. Pick the highest-ratio candidate.
-      5. If after picking the simulated peak didn't drop, roll back and
-         stop — peak isn't activation-dominated.
+      5. If no candidate at all lowers the peak, the loop exits with
+         the reason "no remaining activation lowers the current peak."
+
+    The "walk down the ratio list until one helps" check guarantees
+    every selected activation actually lowers the simulated peak — the
+    selector never picks a candidate whose body window cancels its
+    savings, and never bails after a single failed pick.
 
     Each iteration costs O(|remaining| × N) for the body computations
-    plus O(|evicted| × N) for ``simulate_peak``.  Total O(I² × N).
+    plus up to O(|remaining| × |evicted| × N) for the simulate_peak
+    trials in the worst case.  In practice the highest-ratio candidate
+    helps most of the time and only one trial is needed.
     """
     inters = profiler.intermediates
     peak_before = simulate_peak(profiler, evicted=set())
@@ -247,49 +254,51 @@ def select_activations(profiler: GraphProfiler,
         total_act = sum(i.size_bytes for i in inters)
         mem_limit = peak_before - total_act // 2
 
-    all_acts        = {i.node for i in inters}
-    inter_by_node   = {i.node: i for i in inters}
+    all_acts      = {i.node for i in inters}
+    inter_by_node = {i.node: i for i in inters}
     evicted: Set[fx.Node]  = set()
     order:   List[fx.Node] = []
     remaining = set(all_acts)
-    prev_peak = peak_before
     reason    = "memory target reached"
 
     while remaining:
         peak = simulate_peak(profiler, evicted)
         if peak <= mem_limit:
             break
-        if order and peak >= prev_peak:
-            last = order.pop()
-            evicted.discard(last)
-            remaining.add(last)
-            reason = "no remaining activation lowers the current peak"
-            break
-        prev_peak = peak
 
-        # Body-aware scoring against the current retained set.
+        # Body-aware ratio for every remaining candidate, against the
+        # current retained set.
         retained = all_acts - evicted
-        best, best_ratio = None, -1.0
+        scored: List[tuple[float, fx.Node]] = []
         for n in remaining:
             body = recompute_body(profiler, n, retained - {n})
             cost = body_runtime_ms(profiler, body)
             if cost <= 0:
-                # Fallback to the activation's own runtime so cheap-or-
-                # untimed candidates are still scoreable.
                 cost = inter_by_node[n].recompute_ms
                 if cost <= 0:
                     continue
-            ratio = inter_by_node[n].size_bytes / cost
-            if ratio > best_ratio:
-                best, best_ratio = n, ratio
+            scored.append((inter_by_node[n].size_bytes / cost, n))
 
-        if best is None:
+        if not scored:
             reason = "no candidate has a positive recomputation cost"
             break
 
-        evicted.add(best)
-        order.append(best)
-        remaining.discard(best)
+        # Walk highest-ratio first; the first candidate whose eviction
+        # actually lowers the simulated peak wins.
+        scored.sort(reverse=True)
+        picked: Optional[fx.Node] = None
+        for _, n in scored:
+            if simulate_peak(profiler, evicted | {n}) < peak:
+                picked = n
+                break
+
+        if picked is None:
+            reason = "no remaining activation lowers the current peak"
+            break
+
+        evicted.add(picked)
+        order.append(picked)
+        remaining.discard(picked)
 
     to_recompute, to_retain = validate_recompute_set(profiler, order)
     peak_after = simulate_peak(profiler, to_recompute)
