@@ -130,7 +130,19 @@ def main():
                         "and save to snapshots/<model>_bs<N>.pickle. "
                         "Load at https://pytorch.org/memory_viz to inspect "
                         "every allocation and its stack trace.")
+    p.add_argument("--no-cudnn-bench", action="store_true",
+                   help="disable cuDNN autotuner (cudnn.benchmark=False, "
+                        "cudnn.deterministic=True).  cuDNN will pick simpler "
+                        "convolution algorithms with smaller workspace, so "
+                        "the gap between Estimated and Allocated should "
+                        "shrink — this is the experiment that proves how "
+                        "much of the gap is conv workspace.")
     args = p.parse_args()
+
+    if args.no_cudnn_bench:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        print("cuDNN autotuner OFF; deterministic algorithms.")
 
     if not torch.cuda.is_available():
         print("CUDA unavailable; this script needs a GPU.")
