@@ -237,37 +237,26 @@ def validate_recompute_set(profiler: GraphProfiler,
 # Phase 2 — greedy selection                                                  #
 # --------------------------------------------------------------------------- #
 
-def candidate_recompute_ms(profiler: GraphProfiler,
-                           candidate: fx.Node,
-                           evicted: Set[fx.Node],
-                           all_activations: Set[fx.Node],
-                           fallback_ms: float) -> float:
-    """Recompute cost for one candidate given the current eviction set.
-
-    The cascade is implicit: if some of the candidate's ancestors are
-    already evicted (so not in `retained`), the body grows to cover them too
-    and the runtime sum naturally includes their cost.
-    """
-    retained = all_activations - evicted - {candidate}
-    cost = body_runtime_ms(profiler, recompute_body(profiler, candidate, retained))
-    return cost if cost > 0 else fallback_ms
-
-
 def select_activations(profiler: GraphProfiler,
                        mem_limit: Optional[int] = None) -> SelectionResult:
     """µ-TWO greedy selection.
 
-    At each iteration:
-      1. Compute the current peak with the current eviction set.
+    Per iteration:
+      1. ``simulate_peak`` once to check the current peak.
       2. If the target is reached, stop.
-      3. Score every remaining candidate by `(ratio, peak_drop, size)`.
-         Skip candidates that don't lower the peak.
-      4. Pick the best one, add it to the eviction set.
+      3. Pick the highest ``size/cost`` ratio candidate.  Move it from
+         ``remaining`` into ``evicted``.
+      4. Cascade: every still-remaining candidate that depended on the
+         just-evicted node now pays its cost on top.  Update its cost,
+         recompute its ratio.
+      5. If after picking the peak didn't go down, roll back and stop —
+         the peak isn't activation-dominated (e.g. BERT bs=4/8, where it
+         lives in the optimizer region).
 
-    Default ``mem_limit`` is ``peak_before − total_activation_bytes / 2``
-    (cut roughly half the activation memory).  After the greedy loop,
-    ``validate_recompute_set`` cleans up selections whose recomputation
-    body isn't a valid forward subgraph.
+    ``mem_limit`` defaults to ``peak_before − total_activation_bytes / 2``.
+    Complexity is O(intermediates) ``simulate_peak`` calls and a per-step
+    cascade update — fast enough for the largest model (~360 intermediates,
+    ~9000 nodes).
     """
     inters = profiler.intermediates
     peak_before = simulate_peak(profiler, evicted=set())
@@ -279,39 +268,53 @@ def select_activations(profiler: GraphProfiler,
         total_act = sum(i.size_bytes for i in inters)
         mem_limit = peak_before - total_act // 2
 
-    all_activations = {i.node for i in inters}
-    inter_by_node   = {i.node: i for i in inters}
-    evicted: Set[fx.Node] = set()
-    order:   List[fx.Node] = []
-    remaining = set(all_activations)
+    # Per-candidate state for the cascading-cost model.
+    intermediate_set = {i.node for i in inters}
+    state: Dict[fx.Node, Dict] = {}
+    for i in inters:
+        ancestors = {a for a in i.node.all_input_nodes if a in intermediate_set}
+        state[i.node] = {
+            "size":      i.size_bytes,
+            "cost":      i.recompute_ms,
+            "ancestors": ancestors,
+            "ratio":     i.size_bytes / (i.recompute_ms + 1e-9),
+        }
+
+    evicted:   Set[fx.Node]  = set()
+    order:     List[fx.Node] = []
+    remaining = set(intermediate_set)
+    prev_peak = peak_before
     reason    = "memory target reached"
 
     while remaining:
-        current_peak = simulate_peak(profiler, evicted)
-        if current_peak <= mem_limit:
+        peak = simulate_peak(profiler, evicted)
+        if peak <= mem_limit:
             break
-
-        scored = []
-        for node in remaining:
-            trial_peak = simulate_peak(profiler, evicted | {node})
-            peak_drop  = current_peak - trial_peak
-            if peak_drop <= 0:
-                continue
-            cost  = candidate_recompute_ms(profiler, node, evicted,
-                                           all_activations,
-                                           inter_by_node[node].recompute_ms)
-            ratio = inter_by_node[node].size_bytes / (cost + 1e-9)
-            scored.append((ratio, peak_drop,
-                           inter_by_node[node].size_bytes, node))
-
-        if not scored:
+        if order and peak >= prev_peak:
+            # Last pick didn't help — peak isn't activation-dominated.
+            # Roll back the no-op pick so the report doesn't include it.
+            last = order.pop()
+            evicted.discard(last)
+            remaining.add(last)
             reason = "no remaining activation lowers the current peak"
             break
+        prev_peak = peak
 
-        _, _, _, best = max(scored, key=lambda item: item[:3])
+        best = max(remaining, key=lambda n: state[n]["ratio"])
         evicted.add(best)
         order.append(best)
         remaining.discard(best)
+
+        # Cascade: any still-remaining candidate whose body included `best`
+        # now pays best's cost too (and inherits best's own ancestors).
+        best_state = state[best]
+        for n in remaining:
+            cand = state[n]
+            if best in cand["ancestors"]:
+                cand["ancestors"].discard(best)
+                cand["ancestors"].update(best_state["ancestors"])
+                cand["cost"]  += best_state["cost"]
+                cand["ratio"]  = cand["size"] / (cand["cost"] + 1e-9)
 
     to_recompute, to_retain = validate_recompute_set(profiler, order)
     peak_after = simulate_peak(profiler, to_recompute)
