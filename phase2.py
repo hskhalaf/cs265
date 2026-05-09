@@ -21,7 +21,7 @@ import torch
 
 from activation_checkpoint import (
     select_activations,
-    simulated_memory_timeline_by_role,
+    simulate_timeline_by_role,
 )
 from graph_prof import GraphProfiler
 from graph_tracer import compile
@@ -108,7 +108,7 @@ def profile_phase2(name: str,
             profiler,
             f"{PLOTS_DIR}/phase2_memory_{base}_ac_est.png",
             title=f"{name} — Simulated Memory Breakdown, AC (bs={batch_size})",
-            timeline_by_role=simulated_memory_timeline_by_role(
+            timeline_by_role=simulate_timeline_by_role(
                 profiler, selection.to_recompute,
             ),
         )

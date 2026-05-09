@@ -1,23 +1,33 @@
 """
-Phases 2 and 3 of the µ-TWO activation-checkpointing pipeline.
+Phase 2 — Activation checkpointing (selection) and Phase 3 (graph rewriting).
 
 Phase 2 — selection
 -------------------
-``select_activations`` runs a µ-TWO-style greedy pass over the profiler's
-intermediates.  At each step it tests the remaining activations in the memory
-simulator, keeps only choices that reduce the current peak, and picks the one
-with the best ``size / recompute_time`` ratio.
+``select_activations`` runs the µ-TWO greedy.  At each step it tests every
+remaining intermediate activation in the static memory simulator, keeps only
+the candidates that lower the current peak, and picks the one with the best
+``size / recompute_time`` ratio.  The cascade is handled by re-evaluating
+costs against the *current* eviction set: if a candidate's recompute body
+overlaps with already-evicted ancestors, those ancestors' runtimes are added
+to its cost on the fly.
 
-The simulator accounts for the fact that an evicted
-activation still occupies memory briefly during the forward pass (when it is
-produced) and during the backward pass (when it is recomputed on demand).
+The simulator (``simulate_peak``) is the same live-memory walk as Phase 1,
+with one twist: an evicted activation is treated as live only on the forward
+window (production → last forward use) and at a single backward step
+(``first_bwd_idx`` — the recomputation spike).  Everything else uses the
+ordinary lifetime.
 
 Phase 3 — graph rewriting
 -------------------------
-``rewrite_with_checkpointing`` takes the selection and edits the FX graph in
-place: for each evicted activation we extract its forward-pass subgraph,
-splice a copy of it into the backward pass right before the first backward
-use, and redirect later backward consumers to the recomputed copy.
+``rewrite_with_checkpointing`` takes a selection and edits the FX graph in
+place.  For each evicted activation it extracts the forward-pass subgraph
+that produces it, splices a copy of that subgraph into the backward pass
+right before the activation's first backward use, and redirects the later
+backward consumers to the recomputed copy.
+
+Each evicted activation gets its own independent recomputation chain — no
+shared recomputation across evictions.  This matches the additive cost
+model the selector uses.
 """
 
 from __future__ import annotations
@@ -28,50 +38,98 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import torch
 import torch.fx as fx
 
-from graph_prof import GraphProfiler
+from graph_prof import GraphProfiler, NodeType
 
 
 # --------------------------------------------------------------------------- #
-# Phase 2 — selection                                                         #
+# Selection result                                                            #
 # --------------------------------------------------------------------------- #
-
 
 @dataclass
 class SelectionResult:
-    to_recompute: List[fx.Node]
-    to_retain:    List[fx.Node]
-    peak_before:  int
-    peak_after:   int
-    mem_limit:    Optional[int] = None
-    estimated_recompute_ms: float = 0.0
-    reason: str = ""
+    """The output of ``select_activations``: which activations to recompute,
+    which to retain, and the static numbers describing the trade-off."""
+    to_recompute:           List[fx.Node]
+    to_retain:              List[fx.Node]
+    peak_before:            int
+    peak_after:             int
+    mem_limit:              Optional[int] = None
+    estimated_recompute_ms: float         = 0.0
+    reason:                 str           = ""
 
     @property
     def freed_bytes(self) -> int:
         return self.peak_before - self.peak_after
 
 
-def simulated_memory_timeline_by_role(
-    profiler: GraphProfiler,
-    evicted: Iterable[fx.Node],
-) -> Dict:
-    """Return the static memory timeline after simulated checkpointing."""
-    from graph_prof import NodeType
+# --------------------------------------------------------------------------- #
+# Static helpers — used by both Phase 2 (selection) and Phase 3 (rewrite)     #
+# --------------------------------------------------------------------------- #
 
+def recompute_body(profiler: GraphProfiler,
+                   activation: fx.Node,
+                   retained: Set[fx.Node]) -> List[fx.Node]:
+    """Forward subgraph needed to rebuild ``activation`` from live tensors.
+
+    Walks back from ``activation`` through ``all_input_nodes``, stopping at
+    nodes guaranteed to be alive at backward time: placeholders (params,
+    optimizer state, batched inputs) plus ``retained`` activations.  Returns
+    the body in topological order, including ``activation`` itself but
+    excluding the boundary.
+    """
+    placeholders = {n for n in profiler.nodes if n.op == "placeholder"}
+    boundary     = placeholders | retained
+
+    needed: Set[fx.Node] = set()
+    stack: List[fx.Node] = [activation]
+    while stack:
+        n = stack.pop()
+        if n in needed or n in boundary:
+            continue
+        needed.add(n)
+        stack.extend(n.all_input_nodes)
+    return [n for n in activation.graph.nodes if n in needed]
+
+
+def body_runtime_ms(profiler: GraphProfiler, body: Iterable[fx.Node]) -> float:
+    """Sum the average per-node runtime over a recomputation body."""
+    return sum(profiler.avg_runtime_ms.get(n.name, 0.0) for n in body)
+
+
+def estimate_recompute_ms(profiler: GraphProfiler,
+                          to_recompute: Iterable[fx.Node]) -> float:
+    """Total ms added to the iteration if every node in ``to_recompute`` is
+    rebuilt independently in the backward pass."""
+    selected = set(to_recompute)
+    if not selected:
+        return 0.0
+    all_acts = {i.node for i in profiler.intermediates}
+    retained = all_acts - selected
+    return sum(
+        body_runtime_ms(profiler, recompute_body(profiler, n, retained))
+        for n in sorted(selected, key=lambda n: profiler.idx[n])
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Memory simulator                                                            #
+# --------------------------------------------------------------------------- #
+
+def simulate_timeline_by_role(profiler: GraphProfiler,
+                              evicted: Iterable[fx.Node]) -> Dict[NodeType, List[int]]:
+    """Live bytes at each step, by role, *if* every node in ``evicted`` is
+    recomputed instead of stored.
+
+    Same shape as ``profiler.memory_timeline_by_role()`` but with one rule:
+    if any alias of an owner is in ``evicted`` AND no other alias is used in
+    backward (i.e. nothing keeps the storage alive across the boundary), the
+    owner is live only on the forward window plus a single backward
+    recomputation step.
+    """
     n = len(profiler.nodes)
     evicted = set(evicted)
-    diff = {role: [0] * (n + 1) for role in NodeType}
+    timeline: Dict[NodeType, List[int]] = {role: [0] * n for role in NodeType}
     inter_by_node = {i.node: i for i in profiler.intermediates}
-
-    def add_range(role, lo: int, hi: int, size: int) -> None:
-        if n == 0:
-            return
-        lo = max(0, lo)
-        hi = min(hi, n - 1)
-        if lo > hi:
-            return
-        diff[role][lo] += size
-        diff[role][hi + 1] -= size
 
     for owner, aliases in profiler.aliases_by_owner.items():
         size = profiler.node_size_bytes.get(owner, 0)
@@ -80,7 +138,8 @@ def simulated_memory_timeline_by_role(
 
         role = max(profiler.node_type[a] for a in aliases)
         if owner.op == "placeholder":
-            add_range(role, 0, n - 1, size)
+            for t in range(n):
+                timeline[role][t] += size
             continue
 
         produced = profiler.idx[owner]
@@ -93,135 +152,73 @@ def simulated_memory_timeline_by_role(
         )
 
         if evicted_aliases and not retained_backward_use:
+            # Forward window only — live until the last forward use, then
+            # gone until a one-step recomputation spike at the backward use.
             last_fwd = produced
             for alias in aliases:
                 last_fwd = max(last_fwd, profiler.idx[alias])
-                fwd_users = [
-                    profiler.idx[u] for u in alias.users
-                    if u in profiler.idx and profiler.idx[u] < profiler.sep_bwd_idx
-                ]
+                fwd_users = [profiler.idx[u] for u in alias.users
+                             if u in profiler.idx
+                             and profiler.idx[u] < profiler.sep_bwd_idx]
                 if fwd_users:
                     last_fwd = max(last_fwd, max(fwd_users))
-            add_range(role, produced, last_fwd, size)
+            for t in range(produced, min(last_fwd + 1, n)):
+                timeline[role][t] += size
 
-            spike_steps = {
-                inter_by_node[a].first_bwd_idx
-                for a in evicted_aliases
-                if a in inter_by_node and 0 <= inter_by_node[a].first_bwd_idx < n
-            }
+            spike_steps = {inter_by_node[a].first_bwd_idx
+                           for a in evicted_aliases
+                           if a in inter_by_node
+                           and 0 <= inter_by_node[a].first_bwd_idx < n}
             for t in spike_steps:
-                add_range(role, t, t, size)
+                timeline[role][t] += size
         else:
+            # Ordinary lifetime — produced through last (forward or backward) use.
             last_use = produced
             for alias in aliases:
                 last_use = max(last_use, profiler.idx[alias])
-                user_idx = [
-                    profiler.idx[u] for u in alias.users if u in profiler.idx
-                ]
+                user_idx = [profiler.idx[u] for u in alias.users
+                            if u in profiler.idx]
                 if user_idx:
                     last_use = max(last_use, max(user_idx))
-            add_range(role, produced, last_use, size)
-
-    timeline = {role: [0] * n for role in NodeType}
-    for role in NodeType:
-        running = 0
-        for t in range(n):
-            running += diff[role][t]
-            timeline[role][t] = running
+            for t in range(produced, min(last_use + 1, n)):
+                timeline[role][t] += size
     return timeline
 
 
-def simulate_peak(profiler: GraphProfiler, evicted: Iterable[fx.Node]) -> int:
-    """Estimate peak live memory for a proposed recomputation set."""
-    from graph_prof import NodeType
-
-    timeline = simulated_memory_timeline_by_role(profiler, evicted)
+def simulate_peak(profiler: GraphProfiler,
+                  evicted: Iterable[fx.Node]) -> int:
+    """Peak bytes if every node in ``evicted`` is recomputed."""
+    timeline = simulate_timeline_by_role(profiler, evicted)
     n = len(profiler.nodes)
     if n == 0:
         return 0
     return max(sum(timeline[role][t] for role in NodeType) for t in range(n))
 
 
-def _recompute_body(
-    profiler: GraphProfiler,
-    activation: fx.Node,
-    retained_activations: Set[fx.Node],
-) -> List[fx.Node]:
-    """Forward nodes needed to rebuild ``activation`` from live tensors."""
-    placeholders = {n for n in profiler.nodes if n.op == "placeholder"}
-    boundary = placeholders | retained_activations
-    needed: Set[fx.Node] = set()
-    stack: List[fx.Node] = [activation]
+# --------------------------------------------------------------------------- #
+# Validation: drop selections that don't actually have a forward subgraph     #
+# --------------------------------------------------------------------------- #
 
-    while stack:
-        node = stack.pop()
-        if node in needed or node in boundary:
-            continue
-        needed.add(node)
-        stack.extend(inp for inp in node.all_input_nodes if inp in profiler.idx)
-    return [n for n in profiler.nodes if n in needed]
+def validate_recompute_set(profiler: GraphProfiler,
+                           selected_order: List[fx.Node],
+                           ) -> Tuple[List[fx.Node], List[fx.Node]]:
+    """Iterate to a fixed point: drop any selection whose recomputation body
+    isn't a pure forward call_function/call_method/call_module subgraph.
 
-
-def recompute_body_for_activation(
-    profiler: GraphProfiler,
-    activation: fx.Node,
-    to_recompute: Iterable[fx.Node],
-) -> List[fx.Node]:
-    """Return the nodes Phase 3 would copy for one checkpointed activation."""
-    all_activations = {i.node for i in profiler.intermediates}
-    retained = all_activations - set(to_recompute)
-    return _recompute_body(profiler, activation, retained)
-
-
-def _body_runtime_ms(profiler: GraphProfiler, body: Iterable[fx.Node]) -> float:
-    return sum(profiler.avg_runtime_ms.get(n.name, 0.0) for n in body)
-
-
-def estimate_recompute_ms(
-    profiler: GraphProfiler,
-    to_recompute: Iterable[fx.Node],
-) -> float:
-    """Estimate the latency added by independent recomputation chains."""
-    selected = set(to_recompute)
-    if not selected:
-        return 0.0
-
-    all_activations = {i.node for i in profiler.intermediates}
-    retained = all_activations - selected
-    total = 0.0
-    for node in sorted(selected, key=lambda n: profiler.idx[n]):
-        total += _body_runtime_ms(profiler, _recompute_body(profiler, node, retained))
-    return total
-
-
-def _candidate_recompute_ms(
-    profiler: GraphProfiler,
-    candidate: fx.Node,
-    evicted: Set[fx.Node],
-    all_activations: Set[fx.Node],
-    fallback_ms: float,
-) -> float:
-    retained = all_activations - evicted - {candidate}
-    cost = _body_runtime_ms(profiler, _recompute_body(profiler, candidate, retained))
-    return cost if cost > 0 else fallback_ms
-
-
-def _validate_recompute_set(
-    profiler: GraphProfiler,
-    selected_order: List[fx.Node],
-) -> Tuple[List[fx.Node], List[fx.Node]]:
-    """Drop selections whose recomputation body is not a forward subgraph."""
-    all_activations = {i.node for i in profiler.intermediates}
+    Backward-region nodes can't be in a body (they don't exist yet at
+    recompute time); placeholders are fine because they're alive throughout.
+    """
+    all_acts = {i.node for i in profiler.intermediates}
     selected = set(selected_order)
-    changed = True
+    changed  = True
 
     while changed:
-        changed = False
-        retained = all_activations - selected
+        changed  = False
+        retained = all_acts - selected
         for node in list(selected_order):
             if node not in selected:
                 continue
-            body = _recompute_body(profiler, node, retained)
+            body = recompute_body(profiler, node, retained)
             valid = bool(body) and all(
                 n.op in {"call_function", "call_method", "call_module"}
                 and profiler.idx[n] < profiler.sep_idx
@@ -232,16 +229,46 @@ def _validate_recompute_set(
                 changed = True
 
     to_recompute = [n for n in selected_order if n in selected]
-    to_retain = sorted(all_activations - selected, key=lambda n: profiler.idx[n])
+    to_retain    = sorted(all_acts - selected, key=lambda n: profiler.idx[n])
     return to_recompute, to_retain
 
 
-_simulate_peak = simulate_peak
+# --------------------------------------------------------------------------- #
+# Phase 2 — greedy selection                                                  #
+# --------------------------------------------------------------------------- #
+
+def candidate_recompute_ms(profiler: GraphProfiler,
+                           candidate: fx.Node,
+                           evicted: Set[fx.Node],
+                           all_activations: Set[fx.Node],
+                           fallback_ms: float) -> float:
+    """Recompute cost for one candidate given the current eviction set.
+
+    The cascade is implicit: if some of the candidate's ancestors are
+    already evicted (so not in `retained`), the body grows to cover them too
+    and the runtime sum naturally includes their cost.
+    """
+    retained = all_activations - evicted - {candidate}
+    cost = body_runtime_ms(profiler, recompute_body(profiler, candidate, retained))
+    return cost if cost > 0 else fallback_ms
 
 
 def select_activations(profiler: GraphProfiler,
                        mem_limit: Optional[int] = None) -> SelectionResult:
-    """Choose retained vs recomputed activations with the Phase 2 greedy pass."""
+    """µ-TWO greedy selection.
+
+    At each iteration:
+      1. Compute the current peak with the current eviction set.
+      2. If the target is reached, stop.
+      3. Score every remaining candidate by `(ratio, peak_drop, size)`.
+         Skip candidates that don't lower the peak.
+      4. Pick the best one, add it to the eviction set.
+
+    Default ``mem_limit`` is ``peak_before − total_activation_bytes / 2``
+    (cut roughly half the activation memory).  After the greedy loop,
+    ``validate_recompute_set`` cleans up selections whose recomputation
+    body isn't a valid forward subgraph.
+    """
     inters = profiler.intermediates
     peak_before = simulate_peak(profiler, evicted=set())
     if not inters:
@@ -253,11 +280,11 @@ def select_activations(profiler: GraphProfiler,
         mem_limit = peak_before - total_act // 2
 
     all_activations = {i.node for i in inters}
-    inter_by_node = {i.node: i for i in inters}
+    inter_by_node   = {i.node: i for i in inters}
     evicted: Set[fx.Node] = set()
-    order: List[fx.Node] = []
+    order:   List[fx.Node] = []
     remaining = set(all_activations)
-    reason = "memory target reached"
+    reason    = "memory target reached"
 
     while remaining:
         current_peak = simulate_peak(profiler, evicted)
@@ -267,18 +294,15 @@ def select_activations(profiler: GraphProfiler,
         scored = []
         for node in remaining:
             trial_peak = simulate_peak(profiler, evicted | {node})
-            peak_drop = current_peak - trial_peak
+            peak_drop  = current_peak - trial_peak
             if peak_drop <= 0:
                 continue
-            cost = _candidate_recompute_ms(
-                profiler,
-                node,
-                evicted,
-                all_activations,
-                inter_by_node[node].recompute_ms,
-            )
+            cost  = candidate_recompute_ms(profiler, node, evicted,
+                                           all_activations,
+                                           inter_by_node[node].recompute_ms)
             ratio = inter_by_node[node].size_bytes / (cost + 1e-9)
-            scored.append((ratio, peak_drop, inter_by_node[node].size_bytes, node))
+            scored.append((ratio, peak_drop,
+                           inter_by_node[node].size_bytes, node))
 
         if not scored:
             reason = "no remaining activation lowers the current peak"
@@ -289,14 +313,9 @@ def select_activations(profiler: GraphProfiler,
         order.append(best)
         remaining.discard(best)
 
-    if not remaining and simulate_peak(profiler, evicted) > mem_limit:
-        reason = "all useful activations selected before target was reached"
-
-    to_recompute, to_retain = _validate_recompute_set(profiler, order)
+    to_recompute, to_retain = validate_recompute_set(profiler, order)
     peak_after = simulate_peak(profiler, to_recompute)
-    if peak_after > mem_limit and reason == "memory target reached":
-        reason = "validated recompute set does not reach the target"
-    extra_ms = estimate_recompute_ms(profiler, to_recompute)
+    extra_ms   = estimate_recompute_ms(profiler, to_recompute)
     return SelectionResult(to_recompute, to_retain, peak_before, peak_after,
                            mem_limit, extra_ms, reason)
 
@@ -305,45 +324,47 @@ def select_activations(profiler: GraphProfiler,
 # Phase 3 — graph rewriting                                                   #
 # --------------------------------------------------------------------------- #
 
+def first_backward_user(activation: fx.Node,
+                        profiler: GraphProfiler) -> Optional[fx.Node]:
+    """The earliest backward-region user of ``activation`` (the splice point
+    for its recomputed copy)."""
+    bwd_users = [(profiler.idx[u], u) for u in activation.users
+                 if profiler.idx.get(u, -1) >= profiler.sep_bwd_idx]
+    return min(bwd_users, default=(None, None))[1]
 
-def rewrite_with_checkpointing(gm: fx.GraphModule,
-                               profiler: GraphProfiler,
+
+def rewrite_with_checkpointing(gm:           fx.GraphModule,
+                               profiler:     GraphProfiler,
                                to_recompute: List[fx.Node]) -> fx.GraphModule:
     """For each evicted activation, splice a recomputed copy into the
-    backward pass and redirect later backward consumers to it.
+    backward pass and redirect later backward consumers.
 
-    Algorithm, per evicted activation ``act``:
+    Per evicted activation ``act``:
 
-    1. Walk back from ``act`` until we hit the *boundary* — nodes guaranteed
-       to be alive at backward time (placeholders + retained intermediates).
-       Collect every node strictly between the boundary and ``act``; this is
-       the recomputation **body** in topological order.
-    2. ``node_copy`` each body node into the main graph just before
-       ``act``'s first backward use, building a per-iteration map from
-       original nodes to their copies.  The copy of ``act`` is the
-       "recomputed" tensor.
-    3. Replace ``act`` with the recomputed tensor in every later backward
-       user.
+      1. Walk back from ``act`` to the boundary (placeholders + retained
+         intermediates).  Collect everything between → the *body*.
+      2. ``node_copy`` each body node into the main graph just before
+         ``act``'s first backward use, building a per-iteration map
+         original → copy.  The copy of ``act`` is the recomputed tensor.
+      3. Replace ``act`` with the recomputed copy in every later backward
+         user.
 
-    Each evicted activation gets its own independent body (no shared
-    recomputation across evictions).  This matches the additive cost model
-    that Phase 2 uses when it does the cascading-cost accounting.
+    Each evicted activation gets its own independent body — no sharing
+    across evictions, matching the additive cost model the selector uses.
     """
     if not to_recompute:
         return gm
 
-    placeholders  = {n for n in gm.graph.nodes if n.op == "placeholder"}
     recompute_set = set(to_recompute)
     retain_set    = {i.node for i in profiler.intermediates
                      if i.node not in recompute_set}
-    boundary: Set[fx.Node] = placeholders | retain_set
 
     for act in sorted(to_recompute, key=lambda n: profiler.idx[n]):
-        first_bwd_use = _first_backward_user(act, profiler)
-        if first_bwd_use is None:
+        first_bwd = first_backward_user(act, profiler)
+        if first_bwd is None:
             continue
 
-        body = _gather_recomp_body(act, boundary)
+        body = recompute_body(profiler, act, retain_set)
         if not body:
             continue
 
@@ -351,7 +372,7 @@ def rewrite_with_checkpointing(gm: fx.GraphModule,
         # Boundary nodes aren't in this map, so arg_transform falls through
         # to the original (which is correct — boundary nodes are alive).
         copies: Dict[fx.Node, fx.Node] = {}
-        with gm.graph.inserting_before(first_bwd_use):
+        with gm.graph.inserting_before(first_bwd):
             for orig in body:
                 new = gm.graph.node_copy(
                     orig,
@@ -376,58 +397,30 @@ def rewrite_with_checkpointing(gm: fx.GraphModule,
     return gm
 
 
-def _first_backward_user(act: fx.Node,
-                         profiler: GraphProfiler) -> Optional[fx.Node]:
-    bwd_users = [(profiler.idx[u], u) for u in act.users
-                 if profiler.idx.get(u, -1) >= profiler.sep_bwd_idx]
-    return min(bwd_users, default=(None, None))[1]
-
-
-def _gather_recomp_body(act: fx.Node,
-                        boundary: Set[fx.Node]) -> List[fx.Node]:
-    """Body nodes (in topological order) needed to recompute ``act`` from
-    the boundary.  Excludes the boundary itself; includes ``act``."""
-    needed: Set[fx.Node] = set()
-    stack: List[fx.Node] = [act]
-    while stack:
-        n = stack.pop()
-        if n in needed or n in boundary:
-            continue
-        needed.add(n)
-        stack.extend(n.all_input_nodes)
-    # The graph's nodes are already in topological order, so filter-by-
-    # appearance gives us a valid build order.
-    return [n for n in act.graph.nodes if n in needed]
-
-
 # --------------------------------------------------------------------------- #
 # Reporting                                                                   #
 # --------------------------------------------------------------------------- #
 
-
 def print_ac_decisions(profiler: GraphProfiler,
-                       result: SelectionResult) -> None:
+                       result:   SelectionResult) -> None:
+    """One-screen summary of a selection: per-node breakdown then totals."""
     inter_by_node = {i.node: i for i in profiler.intermediates}
-    saved = sum(inter_by_node[n].size_bytes for n in result.to_recompute)
-    extra_ms = result.estimated_recompute_ms
+    saved    = sum(inter_by_node[n].size_bytes for n in result.to_recompute)
     retained = sum(inter_by_node[n].size_bytes for n in result.to_retain)
+    extra_ms = result.estimated_recompute_ms
 
     print("\n" + "=" * 80)
     print("ACTIVATION CHECKPOINTING DECISIONS  (µ-TWO greedy)")
     print("=" * 80)
 
     print(f"\n  RECOMPUTE ({len(result.to_recompute)}):")
-    print(f"  {'Name':<30} {'Size(KB)':>10} {'Body(ms)':>10} {'Ratio':>12}")
+    print(f"  {'Name':<30} {'Size(KB)':>10} {'Recomp(ms)':>11} {'Ratio':>12}")
     print("  " + "-" * 70)
     for n in result.to_recompute:
         i = inter_by_node[n]
-        cost = _body_runtime_ms(
-            profiler,
-            recompute_body_for_activation(profiler, n, result.to_recompute),
-        )
-        ratio = i.size_bytes / (cost + 1e-9)
+        ratio = i.size_bytes / (i.recompute_ms + 1e-9)
         print(f"  {n.name:<30} {i.size_bytes / 1024:>10.2f}"
-              f" {cost:>10.4f} {ratio:>12.0f}")
+              f" {i.recompute_ms:>11.4f} {ratio:>12.0f}")
 
     print(f"\n  RETAIN ({len(result.to_retain)}):")
     for n in result.to_retain:
@@ -436,12 +429,12 @@ def print_ac_decisions(profiler: GraphProfiler,
 
     print("\n  Summary:")
     if result.mem_limit is not None:
-        print(f"    Target peak:    {result.mem_limit / (1024**2):>8.2f} MB")
-    print(f"    Peak before AC: {result.peak_before / (1024**2):>8.2f} MB")
-    print(f"    Peak after  AC: {result.peak_after  / (1024**2):>8.2f} MB")
-    print(f"    Freed:          {result.freed_bytes / (1024**2):>8.2f} MB")
-    print(f"    Stop reason:    {result.reason}")
-    print(f"    Activation memory freed:    {saved   / (1024**2):>6.2f} MB")
-    print(f"    Activation memory retained: {retained / (1024**2):>6.2f} MB")
-    print(f"    Extra computation cost:     {extra_ms:>6.2f} ms")
+        print(f"    Target peak:      {result.mem_limit / (1024**2):>8.2f} MB")
+    print(f"    Peak before AC:   {result.peak_before  / (1024**2):>8.2f} MB")
+    print(f"    Peak after  AC:   {result.peak_after   / (1024**2):>8.2f} MB")
+    print(f"    Memory freed:     {result.freed_bytes  / (1024**2):>8.2f} MB")
+    print(f"    Bytes recomputed: {saved    / (1024**2):>8.2f} MB")
+    print(f"    Bytes retained:   {retained / (1024**2):>8.2f} MB")
+    print(f"    Extra compute:    {extra_ms:>8.2f} ms")
+    print(f"    Stop reason:      {result.reason}")
     print("=" * 80 + "\n")
