@@ -115,12 +115,29 @@ def validate_recompute_set(profiler: GraphProfiler, selected_order: List[fx.Node
     all_acts = {i.node for i in profiler.intermediates}
     selected = set(selected_order)
 
+    def mutates_boundary(n: fx.Node, body_set: Set[fx.Node]) -> bool:
+        # In-place op is OK iff its mutated input is a body-internal copy;
+        # writing to a placeholder/retained tensor is what corrupts state.
+        schema = getattr(n.target, "_schema", None)
+        if schema is None:
+            return False
+        for i, arg in enumerate(schema.arguments):
+            if arg.alias_info is None or not arg.alias_info.is_write:
+                continue
+            operand = n.args[i] if i < len(n.args) else n.kwargs.get(arg.name)
+            if isinstance(operand, fx.Node) and operand not in body_set:
+                return True
+        return False
+
     def safe(node: fx.Node, retained: Set[fx.Node]) -> bool:
         body = recompute_body(profiler, node, retained)
-        return bool(body) and all(
+        if not body:
+            return False
+        body_set = set(body)
+        return all(
             n.op in {"call_function", "call_method", "call_module"}
             and profiler.idx[n] < profiler.sep_idx
-            and not (n.op == "call_function" and mutates_args(n))
+            and not (n.op == "call_function" and mutates_boundary(n, body_set))
             for n in body
         )
 
