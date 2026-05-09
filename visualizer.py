@@ -58,7 +58,7 @@ def plot_memory_breakdown(profiler: GraphProfiler,
     Vertical guides mark the forward/backward and backward/optimizer
     boundaries, plus the peak step.
     """
-    timeline = profiler.memory_timeline_by_role()
+    timeline = profiler.memory_timeline_by_role(include_runtime_residual=True)
     n_steps = len(profiler.nodes)
     if n_steps == 0:
         print("Warning: empty graph; nothing to plot.")
@@ -83,12 +83,15 @@ def plot_memory_breakdown(profiler: GraphProfiler,
     ax.axvline(peak_step, color="black", linestyle="--", linewidth=0.8,
                label=f"Peak {peak_mb:.1f} MB @ step {peak_step}")
 
-    measured = getattr(profiler, "avg_measured_memory", None)
+    measured = (
+        getattr(profiler, "avg_measured_peak_memory", None)
+        or getattr(profiler, "avg_measured_memory", None)
+    )
     if measured:
         meas_mb = np.array(measured[:n_steps], dtype=float) / (1024 ** 2)
         ax.plot(x[:len(meas_mb)], meas_mb, color="red", linewidth=1.0,
                 alpha=0.85,
-                label=f"Measured (peak {meas_mb.max():.1f} MB)")
+                label=f"Measured node peak {meas_mb.max():.1f} MB")
 
     for boundary, label in [
         (profiler.sep_idx,     "sep"),

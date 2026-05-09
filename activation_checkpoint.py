@@ -69,23 +69,51 @@ def _simulate_peak(profiler: GraphProfiler, evicted: Set[fx.Node]) -> int:
     # Look up by node for O(1) eviction info.
     inter_by_node = {i.node: i for i in profiler.intermediates}
 
-    for node in profiler.nodes:
-        size = profiler.node_size_bytes.get(node, 0)
+    for owner, aliases in profiler.aliases_by_owner.items():
+        size = profiler.node_size_bytes.get(owner, 0)
         if size == 0:
             continue
-        produced = profiler.idx[node]
-        user_idx = [profiler.idx[u] for u in node.users if u in profiler.idx]
-        last_use = max(user_idx, default=produced)
+        produced = 0 if owner.op == OP.PLACEHOLDER else profiler.idx[owner]
+        evicted_aliases = [a for a in aliases if a in evicted]
 
-        if node in evicted:
-            inter = inter_by_node[node]
-            # Forward window: produced through last forward use.
-            for t in range(produced, min(inter.last_fwd_idx + 1, n)):
+        retained_backward_use = any(
+            a not in evicted
+            and any(profiler.idx[u] >= profiler.sep_bwd_idx
+                    for u in a.users if u in profiler.idx)
+            for a in aliases
+        )
+
+        if evicted_aliases and not retained_backward_use:
+            # Forward window: the shared storage exists until its last
+            # forward/loss use.  Backward gets a one-step recomputation spike.
+            last_fwd = produced
+            for alias in aliases:
+                last_fwd = max(last_fwd, profiler.idx[alias])
+                fwd_users = [
+                    profiler.idx[u] for u in alias.users
+                    if u in profiler.idx and profiler.idx[u] < profiler.sep_bwd_idx
+                ]
+                if fwd_users:
+                    last_fwd = max(last_fwd, max(fwd_users))
+            for t in range(produced, min(last_fwd + 1, n)):
                 timeline[t] += size
-            # Backward recomputation spike at first_bwd_idx.
-            if 0 <= inter.first_bwd_idx < n:
-                timeline[inter.first_bwd_idx] += size
+
+            spike_steps = {
+                inter_by_node[a].first_bwd_idx
+                for a in evicted_aliases
+                if a in inter_by_node and 0 <= inter_by_node[a].first_bwd_idx < n
+            }
+            for t in spike_steps:
+                timeline[t] += size
         else:
+            last_use = produced
+            for alias in aliases:
+                last_use = max(last_use, profiler.idx[alias])
+                user_idx = [
+                    profiler.idx[u] for u in alias.users if u in profiler.idx
+                ]
+                if user_idx:
+                    last_use = max(last_use, max(user_idx))
             for t in range(produced, min(last_use + 1, n)):
                 timeline[t] += size
     return max(timeline) if timeline else 0

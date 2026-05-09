@@ -4,8 +4,8 @@ End-to-end sanity checks for the CS265 project.
 Three checks per model, run inside the graph-transformation callback so we
 have direct access to the freshly-traced GraphModule:
 
-  1. PROFILER accuracy   — peak_memory_bytes() within 30 % of
-                            torch.cuda.max_memory_allocated().
+  1. PROFILER accuracy   — runtime-adjusted peak_memory_bytes() within 30 %
+                            of torch.cuda.max_memory_allocated().
   2. AC sanity per arch  — ResNet evicts >= 1 intermediate;
                             BERT (peak in optimizer region) evicts ~none.
   3. AC correctness      — the AC-rewritten graph produces outputs within
@@ -66,7 +66,8 @@ def _profile(gm, args, iters: int = 3) -> GraphProfiler:
 
 def _check_profiler_accuracy(name: str, profiler: GraphProfiler,
                               gm, args) -> bool:
-    estimated = profiler.peak_memory_bytes()
+    fx_only = profiler.peak_memory_bytes()
+    estimated = profiler.peak_memory_bytes(include_runtime_residual=True)
     torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
         gm(*args)
@@ -76,7 +77,8 @@ def _check_profiler_accuracy(name: str, profiler: GraphProfiler,
         return True
     rel = abs(estimated - measured) / measured
     tol = ACCURACY_TOLERANCE.get(name, 0.30)
-    print(f"  estimated={estimated / 1024**2:.2f} MB  "
+    print(f"  fx_visible={fx_only / 1024**2:.2f} MB  "
+          f"profiled={estimated / 1024**2:.2f} MB  "
           f"measured={measured / 1024**2:.2f} MB  rel_err={rel * 100:.1f} %")
     ok = rel <= tol
     print(f"  [{'PASS' if ok else 'FAIL'}] profiler accuracy "

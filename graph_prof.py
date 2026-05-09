@@ -6,6 +6,8 @@ node and collect, per node:
 
 * execution time (CUDA-event timed)
 * memory delta (``torch.cuda.memory_allocated`` before/after)
+* per-node CUDA peak allocation, which catches transient workspace/scratch
+  allocations that are freed before the node returns
 
 and, statically:
 
@@ -59,8 +61,10 @@ class NodeType(Enum):
     OTHER absorbs everything that isn't one of the three "first-class" roles:
     optimizer-state placeholders (Adam moment buffers, step counters), the
     scratch tensors the foreach optimizer decomposition allocates during the
-    step, and backward-pass intermediates that aren't the final accumulated
-    gradient.  All of these are real GPU memory; "OTHER" is just the label.
+    step, backward-pass intermediates that aren't the final accumulated
+    gradient, and runtime-only residuals such as cuDNN/cuBLAS workspaces when
+    measured memory is folded into the timeline.  All of these are real GPU
+    memory; "OTHER" is just the label.
     """
     PARAM = "param"
     ACT   = "activation"
@@ -95,8 +99,7 @@ def _iter_tensors(val: Any) -> Iterable[torch.Tensor]:
         yield val
     elif isinstance(val, (list, tuple)):
         for v in val:
-            if isinstance(v, torch.Tensor):
-                yield v
+            yield from _iter_tensors(v)
 
 
 def _output_alias_targets_inputs(node: fx.Node) -> bool:
@@ -104,7 +107,8 @@ def _output_alias_targets_inputs(node: fx.Node) -> bool:
 
     Catches in-place ops (``_foreach_add_``, ``relu_``), view ops
     (``view``, ``t``, ``transpose``), and fused optimizer ops
-    (``_fused_adam``).  These contribute zero new bytes to live memory.
+    (``_fused_adam``).  These contribute zero new storage; their users still
+    extend the lifetime of the original storage owner.
     """
     target = node.target
     schema = getattr(target, "_schema", None)
@@ -116,14 +120,48 @@ def _output_alias_targets_inputs(node: fx.Node) -> bool:
     return False
 
 
+def _single_output_aliases_input(node: fx.Node) -> bool:
+    """True for single-tensor outputs that alias an input storage."""
+    target = node.target
+    schema = getattr(target, "_schema", None)
+    if schema is None or len(schema.returns) != 1:
+        return False
+    ret = schema.returns[0]
+    if ret.alias_info is None:
+        return False
+    return isinstance(node.meta.get("val"), torch.Tensor)
+
+
 def _node_output_bytes(node: fx.Node) -> int:
-    """Bytes added to live memory by this node, accounting for aliasing."""
+    """Logical bytes in this node's tensor output."""
     if node.op not in (OP.CALL_FUNCTION, OP.PLACEHOLDER):
-        return 0
-    if node.op == OP.CALL_FUNCTION and _output_alias_targets_inputs(node):
         return 0
     val = node.meta.get("val")
     return sum(t.numel() * t.element_size() for t in _iter_tensors(val))
+
+
+def _node_allocation_bytes(node: fx.Node) -> int:
+    """Bytes of new storage allocated by this node.
+
+    Alias/view/in-place nodes have logical tensor sizes, but they do not
+    allocate new storage.  Their users are accounted for by extending the
+    lifetime of the original storage owner.
+    """
+    if node.op == OP.CALL_FUNCTION and _output_alias_targets_inputs(node):
+        return 0
+    return _node_output_bytes(node)
+
+
+_ROLE_PRIORITY: Dict[NodeType, int] = {
+    NodeType.OTHER: 0,
+    NodeType.ACT:   1,
+    NodeType.GRAD:  2,
+    NodeType.PARAM: 3,
+}
+
+
+def _merge_roles(a: NodeType, b: NodeType) -> NodeType:
+    return a if _ROLE_PRIORITY[a] >= _ROLE_PRIORITY[b] else b
 
 
 # --------------------------------------------------------------------------- #
@@ -144,15 +182,19 @@ class GraphProfiler(fx.Interpreter):
         self._classify_tensors()
         self._find_intermediates()
         self._compute_sizes()
+        self._compute_aliases()
 
         # runtime accumulators
         self._node_runtimes_ms: Dict[str, List[float]] = defaultdict(list)
         self._iter_latency_ms: List[float] = []
         self._measured_memory_runs: List[List[int]] = []
+        self._measured_peak_memory_runs: List[List[int]] = []
         self._current_measured: List[int] = []
+        self._current_measured_peak: List[int] = []
         self.avg_runtime_ms: Dict[str, float] = {}
         self.avg_iter_latency_ms: float = 0.0
         self.avg_measured_memory: List[int] = []
+        self.avg_measured_peak_memory: List[int] = []
 
     # --- static analysis ---------------------------------------------------- #
 
@@ -260,12 +302,30 @@ class GraphProfiler(fx.Interpreter):
             self.node_type[n] = NodeType.ACT
 
     def _compute_sizes(self) -> None:
-        """Per-node bytes (storage-aware) and back-fill Intermediate.size_bytes."""
-        self.node_size_bytes: Dict[fx.Node, int] = {
+        """Per-node bytes and back-fill Intermediate.size_bytes."""
+        self.node_logical_size_bytes: Dict[fx.Node, int] = {
             n: _node_output_bytes(n) for n in self.nodes
         }
+        self.node_size_bytes: Dict[fx.Node, int] = {
+            n: _node_allocation_bytes(n) for n in self.nodes
+        }
         for inter in self.intermediates:
-            inter.size_bytes = self.node_size_bytes[inter.node]
+            inter.size_bytes = self.node_logical_size_bytes[inter.node]
+
+    def _compute_aliases(self) -> None:
+        """Map alias/view/in-place nodes to the node that owns their storage."""
+        self.storage_owner: Dict[fx.Node, fx.Node] = {}
+        self.aliases_by_owner: Dict[fx.Node, List[fx.Node]] = defaultdict(list)
+
+        for n in self.nodes:
+            owner = n
+            if n.op == OP.CALL_FUNCTION and _single_output_aliases_input(n):
+                for inp in n.all_input_nodes:
+                    if self.node_logical_size_bytes.get(inp, 0) > 0:
+                        owner = self.storage_owner.get(inp, inp)
+                        break
+            self.storage_owner[n] = owner
+            self.aliases_by_owner[owner].append(n)
 
     # --- runtime ------------------------------------------------------------ #
 
@@ -273,6 +333,7 @@ class GraphProfiler(fx.Interpreter):
         """Time the whole iteration in addition to per-node timing."""
         torch.cuda.synchronize()
         self._current_measured = []
+        self._current_measured_peak = []
         start = torch.cuda.Event(enable_timing=True)
         end   = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -281,9 +342,12 @@ class GraphProfiler(fx.Interpreter):
         torch.cuda.synchronize()
         self._iter_latency_ms.append(start.elapsed_time(end))
         self._measured_memory_runs.append(self._current_measured)
+        self._measured_peak_memory_runs.append(self._current_measured_peak)
         return result
 
     def run_node(self, n: fx.Node) -> Any:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
         start = torch.cuda.Event(enable_timing=True)
         end   = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -292,6 +356,7 @@ class GraphProfiler(fx.Interpreter):
         torch.cuda.synchronize()
         self._node_runtimes_ms[n.name].append(start.elapsed_time(end))
         self._current_measured.append(torch.cuda.memory_allocated())
+        self._current_measured_peak.append(torch.cuda.max_memory_allocated())
         return result
 
     def aggregate_stats(self) -> None:
@@ -303,55 +368,110 @@ class GraphProfiler(fx.Interpreter):
             self.avg_iter_latency_ms = (
                 sum(self._iter_latency_ms) / len(self._iter_latency_ms)
             )
-        if self._measured_memory_runs:
-            n = len(self.nodes)
-            sums   = [0] * n
-            counts = [0] * n
-            for run in self._measured_memory_runs:
-                for i, v in enumerate(run[:n]):
-                    sums[i]   += v
-                    counts[i] += 1
-            self.avg_measured_memory = [
-                sums[i] // counts[i] if counts[i] else 0 for i in range(n)
-            ]
+        self.avg_measured_memory = self._average_runs(
+            self._measured_memory_runs,
+        )
+        self.avg_measured_peak_memory = self._average_runs(
+            self._measured_peak_memory_runs,
+        )
 
     def reset_stats(self) -> None:
         self._node_runtimes_ms.clear()
         self._iter_latency_ms.clear()
         self._measured_memory_runs.clear()
+        self._measured_peak_memory_runs.clear()
         self._current_measured = []
+        self._current_measured_peak = []
         self.avg_runtime_ms.clear()
         self.avg_iter_latency_ms = 0.0
         self.avg_measured_memory = []
+        self.avg_measured_peak_memory = []
+
+    def _average_runs(self, runs: List[List[int]]) -> List[int]:
+        if not runs:
+            return []
+        n = len(self.nodes)
+        sums   = [0] * n
+        counts = [0] * n
+        for run in runs:
+            for i, v in enumerate(run[:n]):
+                sums[i]   += v
+                counts[i] += 1
+        return [sums[i] // counts[i] if counts[i] else 0 for i in range(n)]
 
     # --- queries ------------------------------------------------------------ #
 
-    def memory_timeline_by_role(self) -> Dict[NodeType, List[int]]:
+    def memory_timeline_by_role(
+        self,
+        include_runtime_residual: bool = False,
+    ) -> Dict[NodeType, List[int]]:
         """Live bytes at each step, broken down by tensor role.
 
         A node's contribution is added to every step from its production index
         through its last-use index, inclusive.
+
+        If ``include_runtime_residual`` is true, the gap between the static
+        FX-visible tensor total and the measured per-node CUDA peak is added
+        to ``OTHER`` at each step.  This accounts for real allocations that
+        are not outputs of graph nodes, e.g. cuDNN/cuBLAS workspaces and
+        foreach-internal scratch buffers.
         """
         n = len(self.nodes)
         timeline: Dict[NodeType, List[int]] = {nt: [0] * n for nt in NodeType}
-        for node in self.nodes:
-            size = self.node_size_bytes.get(node, 0)
+        for owner, aliases in self.aliases_by_owner.items():
+            size = self.node_size_bytes.get(owner, 0)
             if size == 0:
                 continue
-            produced = self.idx[node]
-            user_idx = [self.idx[u] for u in node.users if u in self.idx]
-            last_use = max(user_idx, default=produced)
-            role = self.node_type[node]
+            role = self.node_type[owner]
+            if owner.op == OP.PLACEHOLDER:
+                # Placeholders represent state that exists before the
+                # iteration starts (params, optimizer state, batched
+                # inputs) and is still on the GPU when it ends.  They are
+                # the steady-state baseline — live for every step.
+                produced = 0
+                last_use = n - 1
+                for alias in aliases:
+                    role = _merge_roles(role, self.node_type[alias])
+            else:
+                produced = self.idx[owner]
+                last_use = produced
+                for alias in aliases:
+                    last_use = max(last_use, self.idx[alias])
+                    role = _merge_roles(role, self.node_type[alias])
+                    user_idx = [self.idx[u] for u in alias.users
+                                if u in self.idx]
+                    last_use = max([last_use, *user_idx])
             for t in range(produced, min(last_use + 1, n)):
                 timeline[role][t] += size
+        if include_runtime_residual:
+            measured = self.avg_measured_peak_memory or self.avg_measured_memory
+            for t, measured_bytes in enumerate(measured[:n]):
+                static_total = sum(timeline[nt][t] for nt in NodeType)
+                residual = measured_bytes - static_total
+                if residual > 0:
+                    timeline[NodeType.OTHER][t] += residual
         return timeline
 
-    def peak_memory_bytes(self) -> int:
-        roles = self.memory_timeline_by_role()
+    def peak_memory_bytes(self, include_runtime_residual: bool = False) -> int:
+        roles = self.memory_timeline_by_role(include_runtime_residual)
         if not self.nodes:
             return 0
         return max(sum(roles[nt][t] for nt in NodeType)
                    for t in range(len(self.nodes)))
+
+    def measured_peak_memory_bytes(self) -> int:
+        measured = self.avg_measured_peak_memory or self.avg_measured_memory
+        return max(measured, default=0)
+
+    def runtime_residual_by_step(self) -> List[int]:
+        n = len(self.nodes)
+        timeline = self.memory_timeline_by_role(include_runtime_residual=False)
+        measured = self.avg_measured_peak_memory or self.avg_measured_memory
+        residual = [0] * n
+        for t, measured_bytes in enumerate(measured[:n]):
+            static_total = sum(timeline[nt][t] for nt in NodeType)
+            residual[t] = max(0, measured_bytes - static_total)
+        return residual
 
     def iteration_latency_ms(self) -> float:
         return self.avg_iter_latency_ms
@@ -364,9 +484,12 @@ class GraphProfiler(fx.Interpreter):
             counts[nt] += 1
         return counts
 
-    def _peak_breakdown(self) -> "tuple[int, int, Dict[NodeType, int]]":
+    def _peak_breakdown(
+        self,
+        include_runtime_residual: bool = False,
+    ) -> "tuple[int, int, Dict[NodeType, int]]":
         """At the peak step, total live bytes and per-role breakdown."""
-        timeline = self.memory_timeline_by_role()
+        timeline = self.memory_timeline_by_role(include_runtime_residual)
         n = len(self.nodes)
         if n == 0:
             return 0, 0, {nt: 0 for nt in NodeType}
@@ -376,11 +499,17 @@ class GraphProfiler(fx.Interpreter):
         breakdown = {nt: timeline[nt][peak_step] for nt in NodeType}
         return peak_step, per_step_total[peak_step], breakdown
 
-    def print_summary(self, file=None) -> None:
+    def print_summary(
+        self,
+        file=None,
+        include_runtime_residual: bool = False,
+    ) -> None:
         """One-screen summary: peak contribution per role + latency."""
         p = lambda *a, **k: print(*a, **k, file=file) if file else print(*a, **k)
         counts = self._role_node_counts()
-        peak_step, peak_total, peak_by_role = self._peak_breakdown()
+        peak_step, peak_total, peak_by_role = self._peak_breakdown(
+            include_runtime_residual,
+        )
         region_counts: Dict[Region, int] = defaultdict(int)
         for r in self.region.values():
             region_counts[r] += 1
@@ -391,7 +520,8 @@ class GraphProfiler(fx.Interpreter):
           f"optimizer {region_counts[Region.OPTIMIZER]})")
         p(f"  Intermediates: {len(self.intermediates)}")
         p()
-        p(f"  At peak (step {peak_step}):")
+        peak_label = "measured peak" if include_runtime_residual else "FX-visible peak"
+        p(f"  At {peak_label} (step {peak_step}):")
         p(f"    {'Role':<8} {'Nodes':>6} {'Live':>10}")
         for nt in NodeType:
             p(f"    {nt.name:<8} {counts[nt]:>6}"
@@ -411,13 +541,15 @@ class GraphProfiler(fx.Interpreter):
             print("OPERATION SUMMARY", file=f)
             print("=" * 90, file=f)
             print(f"{'#':<5} {'Node':<35} {'Region':<10} {'Role':<10}"
-                  f" {'Time(ms)':>10} {'Size(B)':>12}  Target", file=f)
-            print("-" * 110, file=f)
+                  f" {'Time(ms)':>10} {'Size(B)':>12} {'Alloc(B)':>12}  Target",
+                  file=f)
+            print("-" * 124, file=f)
             for i, n in enumerate(self.nodes):
                 target = str(getattr(n, "target", n.op))[:50]
                 print(f"{i:<5} {n.name[:34]:<35} {self.region[n].value:<10}"
                       f" {self.node_type[n].value:<10}"
                       f" {self.avg_runtime_ms.get(n.name, 0.0):>10.3f}"
+                      f" {self.node_logical_size_bytes.get(n, 0):>12}"
                       f" {self.node_size_bytes.get(n, 0):>12}  {target}",
                       file=f)
 
@@ -446,8 +578,14 @@ class GraphProfiler(fx.Interpreter):
         analysis (notebooks, plots, diff against another run)."""
         import json
 
-        timeline = self.memory_timeline_by_role()
+        timeline = self.memory_timeline_by_role(include_runtime_residual=False)
+        adjusted_timeline = self.memory_timeline_by_role(
+            include_runtime_residual=True,
+        )
         peak_step, peak_total, peak_by_role = self._peak_breakdown()
+        measured_peak_step, measured_peak_total, measured_peak_by_role = (
+            self._peak_breakdown(include_runtime_residual=True)
+        )
 
         data = {
             "summary": {
@@ -458,6 +596,11 @@ class GraphProfiler(fx.Interpreter):
                 "peak_total_bytes":     peak_total,
                 "peak_by_role_bytes":   {nt.name: peak_by_role[nt]
                                          for nt in NodeType},
+                "measured_peak_step":    measured_peak_step,
+                "measured_peak_total_bytes": measured_peak_total,
+                "measured_peak_by_role_bytes": {
+                    nt.name: measured_peak_by_role[nt] for nt in NodeType
+                },
                 "sep_idx":              self.sep_idx,
                 "sep_bwd_idx":          self.sep_bwd_idx,
                 "opt_idx":              self.opt_idx,
@@ -469,7 +612,9 @@ class GraphProfiler(fx.Interpreter):
                     "region":      self.region[n].value,
                     "role":        self.node_type[n].value,
                     "runtime_ms":  self.avg_runtime_ms.get(n.name, 0.0),
-                    "size_bytes":  self.node_size_bytes.get(n, 0),
+                    "size_bytes":  self.node_logical_size_bytes.get(n, 0),
+                    "allocation_size_bytes": self.node_size_bytes.get(n, 0),
+                    "storage_owner": self.storage_owner.get(n, n).name,
                     "target":      str(getattr(n, "target", n.op))[:80],
                 }
                 for i, n in enumerate(self.nodes)
@@ -487,7 +632,12 @@ class GraphProfiler(fx.Interpreter):
             ],
             "timeline_by_role_bytes": {nt.name: timeline[nt]
                                        for nt in NodeType},
+            "timeline_by_role_with_runtime_residual_bytes": {
+                nt.name: adjusted_timeline[nt] for nt in NodeType
+            },
             "measured_memory_bytes":  self.avg_measured_memory,
+            "measured_peak_memory_bytes": self.avg_measured_peak_memory,
+            "runtime_residual_bytes": self.runtime_residual_by_step(),
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)

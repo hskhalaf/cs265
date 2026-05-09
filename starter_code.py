@@ -78,12 +78,17 @@ def profile_model(name: str, batch_size: int,
                   f"  (load at https://pytorch.org/memory_viz)")
         allocated = torch.cuda.max_memory_allocated()   # peak live tensor bytes
         reserved  = torch.cuda.max_memory_reserved()    # peak allocator-pool bytes
-        estimated = profiler.peak_memory_bytes()        # our FX-only static walk
-        invisible = allocated - estimated               # tensors we don't see (workspaces)
+        estimated = profiler.peak_memory_bytes()        # FX-visible tensors only
+        profiled  = profiler.peak_memory_bytes(
+            include_runtime_residual=True,
+        )                                               # node peaks + FX roles
+        residual  = profiled - estimated                # runtime-only CUDA memory
+        gm_delta  = allocated - profiled                # GraphModule vs interpreter
         padding   = reserved  - allocated               # allocator block padding
 
         metrics.update({
             "estimated_mb": estimated / 1024**2,
+            "profiled_mb":  profiled  / 1024**2,
             "allocated_mb": allocated / 1024**2,
             "reserved_mb":  reserved  / 1024**2,
             "latency_ms":   profiler.iteration_latency_ms(),
@@ -92,10 +97,12 @@ def profile_model(name: str, batch_size: int,
         })
 
         # ---- console: concise summary only ----
-        profiler.print_summary()
-        print(f"  Estimate (FX nodes only):    {estimated / 1024**2:>9.2f} MB")
-        print(f"  Allocated (real tensors):    {allocated / 1024**2:>9.2f} MB"
-              f"   ({invisible / 1024**2:+.1f} MB  =  cuDNN/cuBLAS workspace + sim error)")
+        profiler.print_summary(include_runtime_residual=True)
+        print(f"  Static FX-visible tensors:   {estimated / 1024**2:>9.2f} MB")
+        print(f"  Profiled node peak:          {profiled  / 1024**2:>9.2f} MB"
+              f"   ({residual / 1024**2:+.1f} MB runtime residual folded into OTHER)")
+        print(f"  Allocated (compiled graph):  {allocated / 1024**2:>9.2f} MB"
+              f"   ({gm_delta / 1024**2:+.1f} MB vs profiler run)")
         print(f"  Reserved  (allocator pool):  {reserved  / 1024**2:>9.2f} MB"
               f"   ({padding   / 1024**2:+.1f} MB  =  caching-allocator block padding)")
         _print_top_tensors(profiler, k=5)
@@ -200,35 +207,37 @@ def main():
 
     # ---- Consolidated summary table ----
     if any(all_metrics.values()):
-        print(f"\n{'=' * 80}")
+        print(f"\n{'=' * 92}")
         print("PHASE 1 SWEEP SUMMARY")
-        print("=" * 80)
+        print("=" * 92)
         print(f"{'Model':<10} {'BS':>4} {'Nodes':>6} {'Inter':>6}"
-              f" {'Estimate':>10} {'Allocated':>10} {'Reserved':>10}"
-              f" {'Latency':>10}")
-        print("-" * 80)
+              f" {'FX':>10} {'Profiled':>10} {'Allocated':>10}"
+              f" {'Reserved':>10} {'Latency':>10}")
+        print("-" * 92)
         for name, rows in all_metrics.items():
             for r in rows:
                 print(f"{name:<10} {r['batch_size']:>4} {r['n_nodes']:>6}"
                       f" {r['n_intermediates']:>6}"
                       f" {r['estimated_mb']:>8.1f} MB"
+                      f" {r['profiled_mb']:>8.1f} MB"
                       f" {r['allocated_mb']:>8.1f} MB"
                       f" {r['reserved_mb']:>8.1f} MB"
                       f" {r['latency_ms']:>8.1f} ms")
-        print("=" * 80)
+        print("=" * 92)
 
         # Same table to disk for the report.
         os.makedirs(LOGS_DIR, exist_ok=True)
         summary_path = f"{LOGS_DIR}/phase1_summary.txt"
         with open(summary_path, "w") as f:
             f.write(f"{'Model':<10} {'BS':>4} {'Nodes':>6} {'Inter':>6}"
-                    f" {'Estimate':>10} {'Allocated':>10} {'Reserved':>10}"
-                    f" {'Latency':>10}\n")
+                    f" {'FX':>10} {'Profiled':>10} {'Allocated':>10}"
+                    f" {'Reserved':>10} {'Latency':>10}\n")
             for name, rows in all_metrics.items():
                 for r in rows:
                     f.write(f"{name:<10} {r['batch_size']:>4}"
                             f" {r['n_nodes']:>6} {r['n_intermediates']:>6}"
                             f" {r['estimated_mb']:>8.1f} MB"
+                            f" {r['profiled_mb']:>8.1f} MB"
                             f" {r['allocated_mb']:>8.1f} MB"
                             f" {r['reserved_mb']:>8.1f} MB"
                             f" {r['latency_ms']:>8.1f} ms\n")
