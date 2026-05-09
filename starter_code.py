@@ -33,8 +33,8 @@ from visualizer     import plot_memory_breakdown
 PLOTS_DIR = "plots"
 LOGS_DIR  = "logs"
 
-# Default batch size per model.  Override with `-b N` on the command line.
-DEFAULT_BATCH = {"dummy": 1000, "resnet18": 16, "resnet50": 16, "bert": 4}
+# Batch sizes to sweep per model.  Override with `-b 8 16 32` on the CLI.
+DEFAULT_BATCH_SIZES = [4, 8, 32]
 
 
 def profile_model(name: str, batch_size: int) -> None:
@@ -66,11 +66,8 @@ def profile_model(name: str, batch_size: int) -> None:
 
         # ---- console: concise summary only ----
         profiler.print_summary()
-        print()
-        print(f"  Static estimate :  {estimated / 1024**2:>9.2f} MB")
-        print(f"  Measured peak   :  {measured  / 1024**2:>9.2f} MB")
-        print(f"  Unaccounted gap :  {gap:>9.1f} %  "
-              f"(cuDNN/cuBLAS workspace + allocator)")
+        print(f"  Measured peak:     {measured / 1024**2:>7.2f} MB"
+              f"  (gap to estimate: {gap:+.1f} %  =  cuDNN/cuBLAS workspace + allocator)")
         _print_top_tensors(profiler, k=5)
 
         # ---- file: full verbose log ----
@@ -109,9 +106,10 @@ def main():
     p.add_argument("models", nargs="*",
                    help=f"models to profile (any of: {list(MODELS)}). "
                         f"Default: all of them.")
-    p.add_argument("-b", "--batch-size", type=int, default=None,
-                   help="batch size to use for every selected model "
-                        "(overrides the per-model default).")
+    p.add_argument("-b", "--batch-sizes", type=int, nargs="+",
+                   default=DEFAULT_BATCH_SIZES,
+                   help=f"batch sizes to sweep for each model "
+                        f"(default: {DEFAULT_BATCH_SIZES}).")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -123,11 +121,14 @@ def main():
         if name not in MODELS:
             print(f"unknown model '{name}'; choose from {list(MODELS)}")
             continue
-        bs = args.batch_size if args.batch_size is not None \
-             else DEFAULT_BATCH[name]
-        profile_model(name, bs)
+        for bs in args.batch_sizes:
+            try:
+                profile_model(name, bs)
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"  [OOM] {name} bs={bs}: {e}")
+                torch.cuda.empty_cache()
 
-    print(f"\nDone.  Plots saved under ./{PLOTS_DIR}/")
+    print(f"\nDone.  Plots in ./{PLOTS_DIR}/   logs in ./{LOGS_DIR}/")
 
 
 if __name__ == "__main__":

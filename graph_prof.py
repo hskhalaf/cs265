@@ -338,18 +338,29 @@ class GraphProfiler(fx.Interpreter):
 
     # --- pretty printing ---------------------------------------------------- #
 
-    def _role_totals(self) -> "tuple[Dict[NodeType, int], Dict[NodeType, int]]":
+    def _role_node_counts(self) -> Dict[NodeType, int]:
         counts: Dict[NodeType, int] = defaultdict(int)
-        bytes_: Dict[NodeType, int] = defaultdict(int)
-        for n, nt in self.node_type.items():
+        for nt in self.node_type.values():
             counts[nt] += 1
-            bytes_[nt] += self.node_size_bytes.get(n, 0)
-        return counts, bytes_
+        return counts
+
+    def _peak_breakdown(self) -> "tuple[int, int, Dict[NodeType, int]]":
+        """At the peak step, total live bytes and per-role breakdown."""
+        timeline = self.memory_timeline_by_role()
+        n = len(self.nodes)
+        if n == 0:
+            return 0, 0, {nt: 0 for nt in NodeType}
+        per_step_total = [sum(timeline[nt][t] for nt in NodeType)
+                          for t in range(n)]
+        peak_step = max(range(n), key=lambda t: per_step_total[t])
+        breakdown = {nt: timeline[nt][peak_step] for nt in NodeType}
+        return peak_step, per_step_total[peak_step], breakdown
 
     def print_summary(self, file=None) -> None:
-        """One-screen summary: role totals + peak + latency."""
+        """One-screen summary: peak contribution per role + latency."""
         p = lambda *a, **k: print(*a, **k, file=file) if file else print(*a, **k)
-        counts, bytes_ = self._role_totals()
+        counts = self._role_node_counts()
+        peak_step, peak_total, peak_by_role = self._peak_breakdown()
         region_counts: Dict[Region, int] = defaultdict(int)
         for r in self.region.values():
             region_counts[r] += 1
@@ -358,15 +369,17 @@ class GraphProfiler(fx.Interpreter):
           f"(forward {region_counts[Region.FORWARD]}, "
           f"backward {region_counts[Region.BACKWARD]}, "
           f"optimizer {region_counts[Region.OPTIMIZER]})")
-        p(f"  Intermediates: {len(self.intermediates)}  "
-          f"({sum(i.size_bytes for i in self.intermediates) / 1024**2:.2f} MB)")
+        p(f"  Intermediates: {len(self.intermediates)}")
         p()
-        p(f"  {'Role':<8} {'Nodes':>6} {'Total':>12}")
+        p(f"  At peak (step {peak_step}):")
+        p(f"    {'Role':<8} {'Nodes':>6} {'Live':>10}")
         for nt in NodeType:
-            p(f"  {nt.name:<8} {counts[nt]:>6} {bytes_[nt] / 1024**2:>9.2f} MB")
+            p(f"    {nt.name:<8} {counts[nt]:>6}"
+              f" {peak_by_role[nt] / 1024**2:>7.2f} MB")
+        p(f"    {'TOTAL':<8} {len(self.nodes):>6}"
+          f" {peak_total / 1024**2:>7.2f} MB")
         p()
-        p(f"  Estimated peak:    {self.peak_memory_bytes() / 1024**2:>9.2f} MB")
-        p(f"  Iteration latency: {self.avg_iter_latency_ms:>9.2f} ms"
+        p(f"  Iteration latency: {self.avg_iter_latency_ms:>7.2f} ms"
           f"  (avg of {len(self._iter_latency_ms)} runs)")
 
     def write_full_log(self, path: str) -> None:
