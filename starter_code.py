@@ -2,8 +2,8 @@
 Phase 1 entry point.
 
 For each (model, batch_size) pair: trace the training step, profile it with
-``GraphProfiler``, save a stacked-area memory-breakdown plot.  After the
-sweep, save one peak-memory-vs-batch-size bar chart per model.
+``GraphProfiler``, and save a stacked-area memory-breakdown plot.  After the
+sweep, save peak-memory and latency bar charts for each model.
 
 Usage
 -----
@@ -16,6 +16,7 @@ Outputs
 -------
     plots/memory_<model>_bs<N>.png      stacked-area memory breakdown
     plots/peak_vs_batch_<model>.png     peak memory vs batch size (per model)
+    plots/latency_vs_batch_<model>.png  latency vs batch size (per model)
     stdout                              per-run summary + consolidated table
 """
 
@@ -29,11 +30,14 @@ import torch
 from models       import MODELS, init_optimizer_state
 from graph_tracer import compile
 from graph_prof   import GraphProfiler
-from visualizer   import plot_memory_breakdown, plot_peak_vs_batch
+from visualizer   import (
+    plot_latency_vs_batch,
+    plot_memory_breakdown,
+    plot_peak_vs_batch,
+)
 
 
 PLOTS_DIR = "plots"
-LOGS_DIR = "logs"
 DEFAULT_BATCH_SIZES = [4, 8, 16, 32]
 
 
@@ -71,14 +75,6 @@ def profile_model(name: str, batch_size: int) -> dict:
         })
 
         profiler.print_summary()
-
-        os.makedirs(LOGS_DIR, exist_ok=True)
-        log_path = f"{LOGS_DIR}/{name}_bs{batch_size}.txt"
-        json_path = f"{LOGS_DIR}/{name}_bs{batch_size}.json"
-        profiler.write_full_log(log_path)
-        profiler.write_json_log(json_path)
-        print(f"  Full log:  {log_path}")
-        print(f"  JSON:      {json_path}")
 
         os.makedirs(PLOTS_DIR, exist_ok=True)
         plot_path = f"{PLOTS_DIR}/memory_{name}_bs{batch_size}.png"
@@ -119,7 +115,7 @@ def main():
                 print(f"  [OOM] {name} bs={bs}: {e}")
                 torch.cuda.empty_cache()
 
-    # Per-model peak-vs-batch bar chart (the second Phase 1 deliverable).
+    # Per-model summary plots.
     os.makedirs(PLOTS_DIR, exist_ok=True)
     for name, rows in all_metrics.items():
         if len(rows) < 2:
@@ -128,6 +124,11 @@ def main():
             rows,
             f"{PLOTS_DIR}/peak_vs_batch_{name}.png",
             f"{name} — peak memory vs batch size (no AC)",
+        )
+        plot_latency_vs_batch(
+            rows,
+            f"{PLOTS_DIR}/latency_vs_batch_{name}.png",
+            f"{name} — latency vs batch size (no AC)",
         )
 
     # Consolidated table to stdout.
