@@ -148,8 +148,11 @@ class GraphProfiler(fx.Interpreter):
         # runtime accumulators
         self._node_runtimes_ms: Dict[str, List[float]] = defaultdict(list)
         self._iter_latency_ms: List[float] = []
+        self._measured_memory_runs: List[List[int]] = []
+        self._current_measured: List[int] = []
         self.avg_runtime_ms: Dict[str, float] = {}
         self.avg_iter_latency_ms: float = 0.0
+        self.avg_measured_memory: List[int] = []
 
     # --- static analysis ---------------------------------------------------- #
 
@@ -269,6 +272,7 @@ class GraphProfiler(fx.Interpreter):
     def run(self, *args, **kwargs) -> Any:
         """Time the whole iteration in addition to per-node timing."""
         torch.cuda.synchronize()
+        self._current_measured = []
         start = torch.cuda.Event(enable_timing=True)
         end   = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -276,6 +280,7 @@ class GraphProfiler(fx.Interpreter):
         end.record()
         torch.cuda.synchronize()
         self._iter_latency_ms.append(start.elapsed_time(end))
+        self._measured_memory_runs.append(self._current_measured)
         return result
 
     def run_node(self, n: fx.Node) -> Any:
@@ -286,6 +291,7 @@ class GraphProfiler(fx.Interpreter):
         end.record()
         torch.cuda.synchronize()
         self._node_runtimes_ms[n.name].append(start.elapsed_time(end))
+        self._current_measured.append(torch.cuda.memory_allocated())
         return result
 
     def aggregate_stats(self) -> None:
@@ -297,12 +303,26 @@ class GraphProfiler(fx.Interpreter):
             self.avg_iter_latency_ms = (
                 sum(self._iter_latency_ms) / len(self._iter_latency_ms)
             )
+        if self._measured_memory_runs:
+            n = len(self.nodes)
+            sums   = [0] * n
+            counts = [0] * n
+            for run in self._measured_memory_runs:
+                for i, v in enumerate(run[:n]):
+                    sums[i]   += v
+                    counts[i] += 1
+            self.avg_measured_memory = [
+                sums[i] // counts[i] if counts[i] else 0 for i in range(n)
+            ]
 
     def reset_stats(self) -> None:
         self._node_runtimes_ms.clear()
         self._iter_latency_ms.clear()
+        self._measured_memory_runs.clear()
+        self._current_measured = []
         self.avg_runtime_ms.clear()
         self.avg_iter_latency_ms = 0.0
+        self.avg_measured_memory = []
 
     # --- queries ------------------------------------------------------------ #
 
@@ -419,3 +439,55 @@ class GraphProfiler(fx.Interpreter):
             print("SUMMARY", file=f)
             print("=" * 90, file=f)
             self.print_summary(file=f)
+
+    def write_json_log(self, path: str) -> None:
+        """Dump the full profile (per-node table, intermediates, summary,
+        timeline by role, measured-memory series) to JSON for downstream
+        analysis (notebooks, plots, diff against another run)."""
+        import json
+
+        timeline = self.memory_timeline_by_role()
+        peak_step, peak_total, peak_by_role = self._peak_breakdown()
+
+        data = {
+            "summary": {
+                "n_nodes":              len(self.nodes),
+                "n_intermediates":      len(self.intermediates),
+                "iteration_latency_ms": self.avg_iter_latency_ms,
+                "peak_step":            peak_step,
+                "peak_total_bytes":     peak_total,
+                "peak_by_role_bytes":   {nt.name: peak_by_role[nt]
+                                         for nt in NodeType},
+                "sep_idx":              self.sep_idx,
+                "sep_bwd_idx":          self.sep_bwd_idx,
+                "opt_idx":              self.opt_idx,
+            },
+            "nodes": [
+                {
+                    "idx":         i,
+                    "name":        n.name,
+                    "region":      self.region[n].value,
+                    "role":        self.node_type[n].value,
+                    "runtime_ms":  self.avg_runtime_ms.get(n.name, 0.0),
+                    "size_bytes":  self.node_size_bytes.get(n, 0),
+                    "target":      str(getattr(n, "target", n.op))[:80],
+                }
+                for i, n in enumerate(self.nodes)
+            ],
+            "intermediates": [
+                {
+                    "name":          inter.node.name,
+                    "size_bytes":    inter.size_bytes,
+                    "last_fwd_idx":  inter.last_fwd_idx,
+                    "first_bwd_idx": inter.first_bwd_idx,
+                    "lifetime":      inter.first_bwd_idx - inter.last_fwd_idx,
+                    "recompute_ms":  inter.recompute_ms,
+                }
+                for inter in self.intermediates
+            ],
+            "timeline_by_role_bytes": {nt.name: timeline[nt]
+                                       for nt in NodeType},
+            "measured_memory_bytes":  self.avg_measured_memory,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)

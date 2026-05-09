@@ -27,7 +27,7 @@ import torch
 from models         import MODELS, init_optimizer_state
 from graph_tracer   import compile
 from graph_prof     import GraphProfiler, NodeType
-from visualizer     import plot_memory_breakdown
+from visualizer     import plot_memory_breakdown, plot_peak_vs_batch
 
 
 PLOTS_DIR     = "plots"
@@ -38,7 +38,10 @@ SNAPSHOTS_DIR = "snapshots"
 DEFAULT_BATCH_SIZES = [4, 8, 32]
 
 
-def profile_model(name: str, batch_size: int, snapshot: bool = False) -> None:
+def profile_model(name: str, batch_size: int,
+                  snapshot: bool = False) -> dict:
+    """Run Phase 1 on one (model, batch_size).  Returns a dict of
+    headline metrics that the sweep aggregator collects across runs."""
     print(f"\n{'=' * 70}\nPHASE 1: {name}  (batch_size={batch_size})\n{'=' * 70}")
 
     torch.manual_seed(0)
@@ -46,6 +49,9 @@ def profile_model(name: str, batch_size: int, snapshot: bool = False) -> None:
 
     model, optim, inputs, train_step = MODELS[name](batch_size=batch_size)
     init_optimizer_state(model, optim)
+
+    # Captured by the closure below and read after compile() returns.
+    metrics: dict = {"model": name, "batch_size": batch_size}
 
     def transform(gm, args):
         profiler = GraphProfiler(gm)
@@ -76,6 +82,15 @@ def profile_model(name: str, batch_size: int, snapshot: bool = False) -> None:
         invisible = allocated - estimated               # tensors we don't see (workspaces)
         padding   = reserved  - allocated               # allocator block padding
 
+        metrics.update({
+            "estimated_mb": estimated / 1024**2,
+            "allocated_mb": allocated / 1024**2,
+            "reserved_mb":  reserved  / 1024**2,
+            "latency_ms":   profiler.iteration_latency_ms(),
+            "n_intermediates": len(profiler.intermediates),
+            "n_nodes":      len(profiler.nodes),
+        })
+
         # ---- console: concise summary only ----
         profiler.print_summary()
         print(f"  Estimate (FX nodes only):    {estimated / 1024**2:>9.2f} MB")
@@ -85,11 +100,14 @@ def profile_model(name: str, batch_size: int, snapshot: bool = False) -> None:
               f"   ({padding   / 1024**2:+.1f} MB  =  caching-allocator block padding)")
         _print_top_tensors(profiler, k=5)
 
-        # ---- file: full verbose log ----
+        # ---- file: full verbose log + machine-readable dump ----
         os.makedirs(LOGS_DIR, exist_ok=True)
-        log_path = f"{LOGS_DIR}/{name}_bs{batch_size}.txt"
+        log_path  = f"{LOGS_DIR}/{name}_bs{batch_size}.txt"
+        json_path = f"{LOGS_DIR}/{name}_bs{batch_size}.json"
         profiler.write_full_log(log_path)
+        profiler.write_json_log(json_path)
         print(f"\n  Full log:  {log_path}")
+        print(f"  JSON:      {json_path}")
 
         # ---- plot ----
         os.makedirs(PLOTS_DIR, exist_ok=True)
@@ -101,6 +119,7 @@ def profile_model(name: str, batch_size: int, snapshot: bool = False) -> None:
 
     compiled = compile(train_step, transform)
     compiled(model, optim, inputs)
+    return metrics
 
 
 def _print_top_tensors(profiler: GraphProfiler, k: int = 5) -> None:
@@ -149,16 +168,71 @@ def main():
         return
 
     chosen = args.models or list(MODELS.keys())
+
+    # all_metrics[model] = list of per-batch metrics dicts
+    all_metrics: dict[str, list[dict]] = {}
+
     for name in chosen:
         if name not in MODELS:
             print(f"unknown model '{name}'; choose from {list(MODELS)}")
             continue
+        all_metrics[name] = []
         for bs in args.batch_sizes:
             try:
-                profile_model(name, bs, snapshot=args.snapshot)
+                m = profile_model(name, bs, snapshot=args.snapshot)
+                all_metrics[name].append(m)
             except torch.cuda.OutOfMemoryError as e:
                 print(f"  [OOM] {name} bs={bs}: {e}")
                 torch.cuda.empty_cache()
+
+    # ---- Phase 1 deliverable: peak vs batch size, per model ----
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    for name, rows in all_metrics.items():
+        if len(rows) < 2:    # only one batch size — no curve to plot
+            continue
+        bar_rows = [{"batch_size": r["batch_size"],
+                     "peak_mb":    r["allocated_mb"]} for r in rows]
+        plot_peak_vs_batch(
+            bar_rows,
+            f"{PLOTS_DIR}/peak_vs_batch_{name}.png",
+            f"{name} — peak memory vs batch size (no AC)",
+        )
+
+    # ---- Consolidated summary table ----
+    if any(all_metrics.values()):
+        print(f"\n{'=' * 80}")
+        print("PHASE 1 SWEEP SUMMARY")
+        print("=" * 80)
+        print(f"{'Model':<10} {'BS':>4} {'Nodes':>6} {'Inter':>6}"
+              f" {'Estimate':>10} {'Allocated':>10} {'Reserved':>10}"
+              f" {'Latency':>10}")
+        print("-" * 80)
+        for name, rows in all_metrics.items():
+            for r in rows:
+                print(f"{name:<10} {r['batch_size']:>4} {r['n_nodes']:>6}"
+                      f" {r['n_intermediates']:>6}"
+                      f" {r['estimated_mb']:>8.1f} MB"
+                      f" {r['allocated_mb']:>8.1f} MB"
+                      f" {r['reserved_mb']:>8.1f} MB"
+                      f" {r['latency_ms']:>8.1f} ms")
+        print("=" * 80)
+
+        # Same table to disk for the report.
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        summary_path = f"{LOGS_DIR}/phase1_summary.txt"
+        with open(summary_path, "w") as f:
+            f.write(f"{'Model':<10} {'BS':>4} {'Nodes':>6} {'Inter':>6}"
+                    f" {'Estimate':>10} {'Allocated':>10} {'Reserved':>10}"
+                    f" {'Latency':>10}\n")
+            for name, rows in all_metrics.items():
+                for r in rows:
+                    f.write(f"{name:<10} {r['batch_size']:>4}"
+                            f" {r['n_nodes']:>6} {r['n_intermediates']:>6}"
+                            f" {r['estimated_mb']:>8.1f} MB"
+                            f" {r['allocated_mb']:>8.1f} MB"
+                            f" {r['reserved_mb']:>8.1f} MB"
+                            f" {r['latency_ms']:>8.1f} ms\n")
+        print(f"Summary table saved to {summary_path}")
 
     print(f"\nDone.  Plots in ./{PLOTS_DIR}/   logs in ./{LOGS_DIR}/")
 

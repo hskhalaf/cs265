@@ -83,6 +83,13 @@ def plot_memory_breakdown(profiler: GraphProfiler,
     ax.axvline(peak_step, color="black", linestyle="--", linewidth=0.8,
                label=f"Peak {peak_mb:.1f} MB @ step {peak_step}")
 
+    measured = getattr(profiler, "avg_measured_memory", None)
+    if measured:
+        meas_mb = np.array(measured[:n_steps], dtype=float) / (1024 ** 2)
+        ax.plot(x[:len(meas_mb)], meas_mb, color="red", linewidth=1.0,
+                alpha=0.85,
+                label=f"Measured (peak {meas_mb.max():.1f} MB)")
+
     for boundary, label in [
         (profiler.sep_idx,     "sep"),
         (profiler.sep_bwd_idx, "sep_bwd"),
@@ -156,3 +163,41 @@ def plot_peak_memory_vs_batch(rows: List[dict], path: str, title: str) -> None:
 
 def plot_latency_vs_batch(rows: List[dict], path: str, title: str) -> None:
     _grouped_bars(rows, "Iteration latency (ms)", path, title)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 deliverable: peak vs batch size, single series (no AC)              #
+# --------------------------------------------------------------------------- #
+
+
+def plot_peak_vs_batch(rows: List[dict], path: str, title: str,
+                       value_key: str = "peak_mb",
+                       ylabel: str = "Peak memory (MB)") -> None:
+    """Single-series bar chart: one bar per batch size.
+
+    Each row: ``{"batch_size": int, value_key: float}``.  Used for the
+    Phase 1 deliverable (peak memory vs batch size, no AC).
+    """
+    rows = sorted(rows, key=lambda r: r["batch_size"])
+    bs   = [r["batch_size"]   for r in rows]
+    vals = [r[value_key]      for r in rows]
+
+    x = np.arange(len(bs))
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bars = ax.bar(x, vals, width=0.55, color="#4C72B0")
+    for bar in bars:
+        h = bar.get_height()
+        if not np.isnan(h):
+            ax.text(bar.get_x() + bar.get_width() / 2, h,
+                    f"{h:.0f}", ha="center", va="bottom", fontsize=9)
+
+    ax.set_xlabel("Batch size")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(b) for b in bs])
+    ax.grid(axis="y", linestyle=":", alpha=0.5)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Saved {path}")
