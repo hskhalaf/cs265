@@ -1,20 +1,21 @@
-"""
-Phase 1 graph profiler.
+"""Phase 1 graph profiler.
 
-Input: a traced training iteration (forward pass, loss, backward pass, optimizer step) in one FX graph.  
+The input is one FX graph for a full training iteration: forward pass, loss,
+backward pass, and optimizer step.  The profiler walks the graph in
+topological order and records the facts needed for the Phase 1 analysis:
 
-The profiler walks that graph in topological order and records the following:
-1. the region for each operation (forward, loss, backward, or optimizer)
-2. the tensor role for each output (parameter, activation, gradient, optimizer state, or other)
-3. the output size and the amount of new storage the operation creates
-4. the first and last use of each activation saved for backward
-5. CUDA timing and allocator measurements for each operation
+1. The region of each operation: forward, loss, backward, or optimizer.
+2. The role of each tensor: parameter, activation, gradient, optimizer state,
+   or other.
+3. The tensor size and the amount of new storage allocated by each node.
+4. The lifetime of each tensor, including the first backward use of saved
+   activations.
+5. The runtime and allocator measurements for each operation.
 
-Several FX nodes can refer to the same GPU allocation 
-Example: views, in-place ops, and getitem nodes that unpack multi-output operations.
-
-The profiler maps each node to the node that owns its storage, 
-then counts each allocation once over the interval where that storage is live.
+The memory model is storage-aware.  Views, in-place operations, and some
+getitem nodes can point to storage owned by another node.  The profiler maps
+each node to a storage owner and counts each allocation once over the interval
+where that storage is live.
 """
 
 from __future__ import annotations
@@ -36,9 +37,9 @@ class NodeType(IntEnum):
     GRAD  = 3
     PARAM = 4
 
-# the numeric values serve as the priority order. 
-# this is useful when several aliases share one storage allocation.  
-# e.g., if an activation is later viewed by another node, the shared storage is activation memory.
+# The numeric values define role priority when several FX nodes share one
+# storage allocation.  For example, if an activation is later viewed by another
+# node, the shared storage should still be counted as activation memory.
 
 class Region(Enum):
     FORWARD   = "forward"
@@ -63,11 +64,13 @@ def iter_tensors(val: Any) -> Iterable[torch.Tensor]:
         for v in val: 
             yield from iter_tensors(v)
 
-def alias_in_schema(node: fx.Node) -> bool: # to avoid double counting
+def alias_in_schema(node: fx.Node) -> bool:
+    """Return True when an operator's schema says its output aliases an input."""
     schema = getattr(node.target, "_schema", None)
     return schema is not None and any(r.alias_info is not None for r in schema.returns)
 
-def is_getitem(node: fx.Node) -> bool: # useful bcz anything that returns more than one tensor gets unpacked through operator.getitem. however getitem is a reference, not an allocation
+def is_getitem(node: fx.Node) -> bool:
+    """Return True for getitem nodes that unpack multi-output operators."""
     return (node.op == "call_function" and (node.target is operator.getitem or getattr(node.target, "__name__", None) == "getitem"))
 
 def contains_tensor(val: Any) -> bool: 
@@ -86,6 +89,7 @@ def output_bytes(node: fx.Node) -> int:
     return sum(t.numel() * t.element_size() for t in iter_tensors(node.meta.get("val")))
 
 def allocation_bytes(node: fx.Node) -> int:
+    """Return the number of newly allocated bytes attributed to this node."""
     if node.op == "call_function":
         if alias_in_schema(node): return 0
         if is_container(node) and all(is_getitem(u) for u in node.users): return 0
@@ -223,6 +227,45 @@ class GraphProfiler(fx.Interpreter):
                         break
             self.storage_owner[n] = owner
             self.aliases_by_owner[owner].append(n)
+
+    def node_last_use_idx(self, node: fx.Node) -> int:
+        """Return the last graph step that reads this node's output."""
+        if node.op == "placeholder":
+            return len(self.nodes) - 1
+        last = self.idx[node]
+        for user in node.users:
+            if user in self.idx:
+                last = max(last, self.idx[user])
+        return last
+
+    def node_records(self) -> List[dict]:
+        """Return one dictionary per node with the Phase 1 profiling facts."""
+        inter_by_node = {inter.node: inter for inter in self.intermediates}
+        records: List[dict] = []
+        for node in self.nodes:
+            inter = inter_by_node.get(node)
+            owner = self.storage_owner.get(node, node)
+            records.append({
+                "index": self.idx[node],
+                "name": node.name,
+                "op": node.op,
+                "target": str(node.target),
+                "region": self.region[node].value,
+                "role": self.node_type[node].name,
+                "logical_size_bytes": self.node_logical_size_bytes.get(node, 0),
+                "allocation_size_bytes": self.node_size_bytes.get(node, 0),
+                "storage_owner": owner.name,
+                "produced_idx": 0 if node.op == "placeholder" else self.idx[node],
+                "last_use_idx": self.node_last_use_idx(node),
+                "runtime_ms": self.avg_runtime_ms.get(node.name, 0.0),
+                "memory_delta_bytes": self.avg_memory_delta_bytes.get(node.name, 0),
+                "memory_peak_bytes": self.avg_memory_peak_bytes.get(node.name, 0),
+                "is_activation_candidate": inter is not None,
+                "last_forward_use_idx": inter.last_fwd_idx if inter else -1,
+                "first_backward_use_idx": inter.first_bwd_idx if inter else -1,
+                "recompute_ms": inter.recompute_ms if inter else 0.0,
+            })
+        return records
 
     def reset_stats(self) -> None:
         self._runtimes_ms: Dict[str, List[float]] = defaultdict(list)

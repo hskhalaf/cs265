@@ -96,26 +96,46 @@ class Experiment:
         print("\n  -- no AC --")
         prof_no_ac.print_summary()
 
-        # 2. Capture original output (for the gradient/output validation).
-        with torch.no_grad():
-            original_out = gm(*args)
+        # 1b. Snapshot the no-AC numbers AND save the no-AC plot NOW,
+        # before any rewrite mutates the graph.  Both ``peak_memory_bytes``
+        # and ``memory_timeline_by_role`` read ``node.users`` live, so
+        # calling them later (after the rewriter has redirected backward
+        # consumers off the original activations) would silently report
+        # something close to the AC peak.
+        peak_no_ac_mb    = prof_no_ac.peak_memory_bytes() / 1024**2
+        latency_no_ac_ms = prof_no_ac.iteration_latency_ms()
+        self._save_breakdown_plot(prof_no_ac, "no_ac")
 
-        # 3. Phase 2: select activations to recompute.
+        # 2. Phase 2: select activations to recompute.
         selection = select_activations(prof_no_ac, mem_limit=self.mem_limit_bytes)
         print_ac_decisions(prof_no_ac, selection)
 
-        # 4. Phase 3: rewrite the graph in place.
+        # 3. Phase 3: rewrite the graph in place.
         gm_ac = rewrite_with_checkpointing(gm, prof_no_ac, selection.to_recompute)
 
-        # 5. Validate: rewritten outputs match the original within 1e-4.
+        # 4. Real validation: snapshot model + optimizer state, run gm
+        #    from that state, snapshot the result, restore the original
+        #    state, run gm_ac from the same starting point, snapshot, and
+        #    compare the two end states (params + buffers + optim tensors).
+        #    Output tensors are useless here — train_step returns None — so
+        #    we compare the *side effects* (parameter updates etc.).
+        baseline   = self._snapshot_state()
         with torch.no_grad():
-            ac_out = gm_ac(*args)
-        max_diff = self._max_output_diff(original_out, ac_out)
-        ok = max_diff <= 1e-4
-        print(f"\n  Output diff (max abs): {max_diff:.2e}  "
+            gm(*self._clone_args(args))
+        after_orig = self._snapshot_state()
+
+        self._restore_state(baseline)
+        with torch.no_grad():
+            gm_ac(*self._clone_args(args))
+        after_ac   = self._snapshot_state()
+        self._restore_state(baseline)              # leave state clean for §5
+
+        max_diff = self._max_state_diff(after_orig, after_ac)
+        ok = max_diff <= 1e-3                      # tolerance for FP noise
+        print(f"\n  Param-update diff (max abs): {max_diff:.2e}  "
               f"[{'PASS' if ok else 'FAIL'}]")
 
-        # 6. Re-profile the rewritten graph (with AC).
+        # 5. Re-profile the rewritten graph (with AC).
         prof_ac = self._profile(gm_ac, args)
         print("\n  -- with AC --")
         prof_ac.print_summary()
@@ -124,17 +144,17 @@ class Experiment:
         self.metrics.update({
             "n_recompute":      len(selection.to_recompute),
             "n_retain":         len(selection.to_retain),
-            "peak_no_ac_mb":    prof_no_ac.peak_memory_bytes() / 1024**2,
+            "peak_no_ac_mb":    peak_no_ac_mb,
             "peak_ac_mb":       prof_ac.peak_memory_bytes()    / 1024**2,
-            "latency_no_ac_ms": prof_no_ac.iteration_latency_ms(),
+            "latency_no_ac_ms": latency_no_ac_ms,
             "latency_ac_ms":    prof_ac.iteration_latency_ms(),
             "max_output_diff":  max_diff,
             "ac_correct":       ok,
             "selection_reason": selection.reason,
         })
 
-        # 8. Per-(model, bs) breakdown plots.
-        self._save_breakdown_plots(prof_no_ac, prof_ac)
+        # 8. Per-(model, bs) AC breakdown plot (no-AC was saved earlier).
+        self._save_breakdown_plot(prof_ac, "ac")
         return gm_ac
 
     def _profile(self, gm: fx.GraphModule, args: Any) -> GraphProfiler:
@@ -148,32 +168,75 @@ class Experiment:
         profiler.aggregate_stats()
         return profiler
 
-    def _max_output_diff(self, a: Any, b: Any) -> float:
-        """Recursively compare two output structures, return max abs diff."""
-        if isinstance(a, torch.Tensor):
-            if not isinstance(b, torch.Tensor) or a.shape != b.shape:
-                return float("inf")
-            return (a.float() - b.float()).abs().max().item()
-        if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-            if len(a) != len(b):
-                return float("inf")
-            return max((self._max_output_diff(x, y) for x, y in zip(a, b)),
-                       default=0.0)
-        return 0.0
+    # ---- validation helpers --------------------------------------------- #
 
-    def _save_breakdown_plots(self, prof_no_ac: GraphProfiler,
-                              prof_ac: GraphProfiler) -> None:
+    def _clone_args(self, args: Any) -> Any:
+        """Deep-clone any tensors in ``args`` so the gm doesn't mutate the
+        caller's inputs (defensive — most forward ops don't mutate inputs,
+        but a custom op or in-place op in an unusual position could)."""
+        def clone(obj: Any) -> Any:
+            if isinstance(obj, torch.Tensor):
+                return obj.clone()
+            if isinstance(obj, (list, tuple)):
+                return type(obj)(clone(x) for x in obj)
+            return obj
+        return clone(args)
+
+    def _snapshot_state(self):
+        """Snapshot params, buffers, and optimizer-state tensors as cloned
+        tensors.  Optimizer-state tensors are keyed by ``id`` so we can
+        restore them in place later (Adam's ``exp_avg`` / ``exp_avg_sq`` /
+        ``step`` are mutated in place by ``optim.step``)."""
+        params  = [p.detach().clone() for p in self.model.parameters()]
+        buffers = [b.detach().clone() for b in self.model.buffers()]
+        optim:  dict = {}
+        for p_state in self.optimizer.state.values():
+            for v in p_state.values():
+                if isinstance(v, torch.Tensor):
+                    optim[id(v)] = v.detach().clone()
+        return params, buffers, optim
+
+    def _restore_state(self, snapshot) -> None:
+        """In-place copy snapshot tensors back into the live params /
+        buffers / optimizer state."""
+        params, buffers, optim = snapshot
+        for p, p0 in zip(self.model.parameters(), params):
+            p.data.copy_(p0)
+        for b, b0 in zip(self.model.buffers(), buffers):
+            b.data.copy_(b0)
+        for p_state in self.optimizer.state.values():
+            for v in p_state.values():
+                if isinstance(v, torch.Tensor) and id(v) in optim:
+                    v.copy_(optim[id(v)])
+
+    def _max_state_diff(self, snap1, snap2) -> float:
+        """Maximum absolute element-wise difference across all tensors in
+        the two snapshots (params, buffers, optimizer state).  Returns 0
+        when the two end states are bit-identical."""
+        params1, buffers1, optim1 = snap1
+        params2, buffers2, optim2 = snap2
+        diffs: list[float] = []
+        for p1, p2 in zip(params1, params2):
+            diffs.append((p1.float() - p2.float()).abs().max().item())
+        for b1, b2 in zip(buffers1, buffers2):
+            diffs.append((b1.float() - b2.float()).abs().max().item())
+        for k in optim1:
+            if k in optim2:
+                diffs.append((optim1[k].float() - optim2[k].float()).abs().max().item())
+        return max(diffs) if diffs else 0.0
+
+    def _save_breakdown_plot(self, profiler: GraphProfiler, suffix: str) -> None:
+        """Save one breakdown chart.  ``suffix`` is "no_ac" or "ac".  Must be
+        called when the profiler's view of the graph still matches what we
+        want to plot — i.e., the no-AC chart BEFORE the rewrite mutates
+        ``node.users``."""
         os.makedirs(PLOTS_DIR, exist_ok=True)
-        base = f"{self.model_name}_bs{self.batch_size}"
+        base    = f"{self.model_name}_bs{self.batch_size}"
+        title   = ("no AC" if suffix == "no_ac" else "with AC")
         plot_memory_breakdown(
-            prof_no_ac,
-            f"{PLOTS_DIR}/benchmark_memory_{base}_no_ac.png",
-            title=f"{self.model_name} — Memory Breakdown, no AC (bs={self.batch_size})",
-        )
-        plot_memory_breakdown(
-            prof_ac,
-            f"{PLOTS_DIR}/benchmark_memory_{base}_ac.png",
-            title=f"{self.model_name} — Memory Breakdown, with AC (bs={self.batch_size})",
+            profiler,
+            f"{PLOTS_DIR}/benchmark_memory_{base}_{suffix}.png",
+            title=f"{self.model_name} — Memory Breakdown, {title} (bs={self.batch_size})",
         )
 
     def run(self) -> dict:

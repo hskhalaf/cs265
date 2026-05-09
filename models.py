@@ -1,40 +1,25 @@
 """
-Model factory for the CS265 project.
+useful notes:
 
-Each `make_*` returns a 4-tuple `(model, optimizer, example_inputs, train_step)`
-in a uniform shape so that all callers (starter_code, validate, benchmarks)
-share one entry point.
-
-Conventions:
-- `example_inputs` is always a tuple, even for single-input models.
-- `train_step(model, optim, example_inputs)` runs forward + loss + backward +
-  optimizer.step + zero_grad.  The loss is wrapped in `SEPFunction.apply()`
-  so the traced FX graph contains the boundary marker nodes the profiler
-  looks for.
-- Every optimizer is Adam with `foreach=True, capturable=True` so the
-  optimizer step traces into a sequence of `_foreach_*` ops.
+- each `make_*` returns a (model, optimizer, example_inputs, train_step) tuple
+- train_step(model, optim, example_inputs) runs forward + loss + backward + optimizer.step + zero_grad
+- the loss is wrapped in SEPFunction.apply()
+- every optimizer is Adam with `foreach=True, capturable=True` so the optimizer step traces into a sequence of `_foreach_*` ops.
 """
 
 from typing import Any, Callable, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from graph_tracer import SEPFunction
-
+from torchvision.models import resnet18, resnet50
+from transformers import BertConfig, BertForSequenceClassification
 
 ModelTuple = Tuple[nn.Module, torch.optim.Optimizer, Tuple[Any, ...], Callable]
 
 
-# --------------------------------------------------------------------------- #
-# Dummy MLP                                                                   #
-# --------------------------------------------------------------------------- #
-
 
 class DummyModel(nn.Module):
-    """Stack of `layers` (Linear, ReLU) blocks of width `dim`."""
-
     def __init__(self, layers: int = 10, dim: int = 100):
         super().__init__()
         blocks = []
@@ -46,13 +31,13 @@ class DummyModel(nn.Module):
         return self.net(x)
 
 
-def make_dummy(batch_size: int = 1000, layers: int = 10, dim: int = 100,
-               device: str = "cuda") -> ModelTuple:
+def make_dummy(batch_size: int = 1000, layers: int = 10, dim: int = 100, device: str = "cuda") -> ModelTuple:
     model = DummyModel(layers=layers, dim=dim).to(device)
     batch = torch.randn(batch_size, dim, device=device)
-    optim = torch.optim.Adam(model.parameters(), lr=1e-2,
-                             foreach=True, capturable=True)
-
+    optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True, capturable=True)
+    # foreach=True decomposes Adam's step into a chain of _foreach_* operations during tracing, 
+    # which is what produces the foreach-getitem patterns the profiler handles. 
+    # capturable=True keeps the step counter as a tensor instead of a Python int
     def train_step(model, optim, example_inputs):
         (x,) = example_inputs
         loss = model(x).sum()
@@ -64,21 +49,13 @@ def make_dummy(batch_size: int = 1000, layers: int = 10, dim: int = 100,
     return model, optim, (batch,), train_step
 
 
-# --------------------------------------------------------------------------- #
-# ResNet (18 / 50)                                                            #
-# --------------------------------------------------------------------------- #
-
-
-def _make_resnet(arch: str, batch_size: int, num_classes: int,
-                 device: str) -> ModelTuple:
-    from torchvision.models import resnet18, resnet50
+def _make_resnet(arch: str, batch_size: int, num_classes: int, device: str) -> ModelTuple:
     builder = {"resnet18": resnet18, "resnet50": resnet50}[arch]
     with torch.device(device):
         model = builder(num_classes=num_classes)
     inputs = torch.randn(batch_size, 3, 224, 224, device=device)
     targets = torch.randint(0, num_classes, (batch_size,), device=device)
-    optim = torch.optim.Adam(model.parameters(), lr=1e-2,
-                             foreach=True, capturable=True)
+    optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True, capturable=True)
 
     def train_step(model, optim, example_inputs):
         x, y = example_inputs
@@ -90,23 +67,15 @@ def _make_resnet(arch: str, batch_size: int, num_classes: int,
 
     return model, optim, (inputs, targets), train_step
 
-
 def make_resnet18(batch_size: int = 16, device: str = "cuda") -> ModelTuple:
     return _make_resnet("resnet18", batch_size, num_classes=10, device=device)
-
 
 def make_resnet50(batch_size: int = 16, device: str = "cuda") -> ModelTuple:
     return _make_resnet("resnet50", batch_size, num_classes=10, device=device)
 
 
-# --------------------------------------------------------------------------- #
-# BERT-base                                                                   #
-# --------------------------------------------------------------------------- #
 
-
-def make_bert(batch_size: int = 4, seq_len: int = 128,
-              device: str = "cuda") -> ModelTuple:
-    from transformers import BertConfig, BertForSequenceClassification
+def make_bert(batch_size: int = 4, seq_len: int = 128, device: str = "cuda") -> ModelTuple:
 
     num_classes = 2
     config = BertConfig(
@@ -116,12 +85,10 @@ def make_bert(batch_size: int = 4, seq_len: int = 128,
         torchscript=True,                # FX-friendly
     )
     model = BertForSequenceClassification(config).to(device)
-    input_ids = torch.randint(0, config.vocab_size,
-                              (batch_size, seq_len), device=device)
+    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
     mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
     labels = torch.randint(0, num_classes, (batch_size,), device=device)
-    optim = torch.optim.Adam(model.parameters(), lr=1e-2,
-                             foreach=True, capturable=True)
+    optim = torch.optim.Adam(model.parameters(), lr=1e-2, foreach=True, capturable=True)
 
     def train_step(model, optim, example_inputs):
         ids, m, y = example_inputs
@@ -134,26 +101,13 @@ def make_bert(batch_size: int = 4, seq_len: int = 128,
     return model, optim, (input_ids, mask, labels), train_step
 
 
-# --------------------------------------------------------------------------- #
-# Registry + helper                                                           #
-# --------------------------------------------------------------------------- #
+MODELS: dict[str, Callable[..., ModelTuple]] = {"dummy": make_dummy, "resnet18": make_resnet18, "resnet50": make_resnet50, "bert": make_bert,}
 
-
-MODELS: dict[str, Callable[..., ModelTuple]] = {
-    "dummy":    make_dummy,
-    "resnet18": make_resnet18,
-    "resnet50": make_resnet50,
-    "bert":     make_bert,
-}
-
-
-def init_optimizer_state(model: nn.Module,
-                         optim: torch.optim.Optimizer) -> None:
-    """Run one dummy step so Adam allocates its moment buffers.
-
-    The graph tracer needs the optimizer state to already exist when it
-    snapshots the optimizer; without this, Adam's lazy init fires inside the
-    traced graph and the moment buffers don't appear as placeholders.
+def init_optimizer_state(model: nn.Module, optim: torch.optim.Optimizer) -> None:
+    """
+    run one dummy step so Adam allocates its moment buffers.
+    reason: the graph tracer needs the optimizer state to already exist when it snapshots the optimizer; 
+    without this, Adam's lazy init fires inside the traced graph and the moment buffers don't appear as placeholders.
     """
     for p in model.parameters():
         if p.requires_grad:

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 import torch
 import torch.fx as fx
-from graph_prof import GraphProfiler, NodeType
+from graph_prof import GraphProfiler, NodeType, alias_in_schema
 
 
 @dataclass
@@ -41,20 +41,21 @@ def body_runtime_ms(profiler: GraphProfiler, body: Iterable[fx.Node]) -> float:
 
 
 def estimate_recompute_ms(profiler: GraphProfiler, to_recompute: Iterable[fx.Node]) -> float:
-    """Total time added by the backward recomputations (shared model).
+    """Total time added by the backward recomputations (independent model).
 
-    Each unique node appearing in any eviction's body is computed exactly
-    once in the backward pass — so total cost is the runtime of the
-    *union* of all bodies, not the sum across bodies.
+    Each evicted activation is recomputed in its own chain — bodies are
+    NOT shared across evictions.  Cost is the sum of per-eviction body
+    runtimes, matching what ``rewrite_with_checkpointing`` actually
+    materializes.
     """
     selected = set(to_recompute)
     if not selected: return 0.0
     all_acts = {i.node for i in profiler.intermediates}
     retained = all_acts - selected
-    union_body: Set[fx.Node] = set()
-    for act in selected:
-        union_body |= set(recompute_body(profiler, act, retained))
-    return body_runtime_ms(profiler, union_body)
+    return sum(
+        body_runtime_ms(profiler, recompute_body(profiler, n, retained))
+        for n in sorted(selected, key=lambda n: profiler.idx[n])
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -69,19 +70,23 @@ def first_bwd_use_idx(act: fx.Node, profiler: GraphProfiler) -> int:
 
 
 def simulate_timeline_by_role(profiler: GraphProfiler, evicted: Iterable[fx.Node]) -> Dict[NodeType, List[int]]:
-    """Live bytes at each step, by role, modeling the *shared* AC rewrite.
-
-    Two contributions per step:
+    """Live bytes at each step, by role, modeling the *independent* AC rewrite.
 
     (A) Original tensors.  An evicted activation's storage is freed after
         its last forward use (no backward consumer in the rewritten graph).
         Everything else uses its normal lifetime.
 
-    (B) Recomputed copies.  Each unique body node X (across all evictions
-        whose recomputation chain includes X) is materialized ONCE in the
-        backward pass at the splice point of the earliest eviction needing
-        it, and stays alive through the latest eviction needing it (plus
-        the redirected backward users of X if X is itself an eviction).
+    (B) Recomputed copies (per-eviction).  Each evicted activation's body
+        is materialized as its own independent chain at the splice point.
+        If two evictions share an ancestor X, X is materialized TWICE —
+        matching what ``rewrite_with_checkpointing`` actually does (each
+        evicted activation gets its own ``copies`` map).
+
+        - The activation copy itself lives from its splice point through
+          the last redirected backward user.
+        - Other body intermediates are alive briefly during the chain;
+          we approximate their contribution as a single-step spike at
+          the splice point.
     """
     n = len(profiler.nodes)
     evicted = set(evicted)
@@ -131,45 +136,37 @@ def simulate_timeline_by_role(profiler: GraphProfiler, evicted: Iterable[fx.Node
             for t in range(produced, min(last_use + 1, n)):
                 timeline[role][t] += size
 
-    # ----- (B) Recomputed copies (shared) --------------------------------- #
+    # ----- (B) Recomputed copies (independent, per-eviction) -------------- #
     if not evicted:
         return timeline
 
     all_acts = {i.node for i in profiler.intermediates}
     retained = all_acts - evicted
 
-    # For each unique body node, find its lifetime window in backward.
-    # Window = [earliest first-bwd-use of an eviction needing it,
-    #           latest first-bwd-use of an eviction needing it].
-    # For evictions that ARE the body node, also extend to their latest
-    # redirected backward user.
-    body_window: Dict[fx.Node, Tuple[int, int]] = {}
     for act in evicted:
         first_idx = first_bwd_use_idx(act, profiler)
         if first_idx < 0:
             continue
         body = recompute_body(profiler, act, retained)
-        for x in body:
-            lo, hi = body_window.get(x, (first_idx, first_idx))
-            body_window[x] = (min(lo, first_idx), max(hi, first_idx))
-
-    # Extend evicted activations' windows to their last redirected user.
-    for act in evicted:
-        if act not in body_window:
-            continue
+        # Activation copy lives from splice point through last redirected user.
         bwd_users = [profiler.idx[u] for u in act.users
                      if profiler.idx.get(u, -1) >= profiler.sep_bwd_idx]
-        if bwd_users:
-            lo, hi = body_window[act]
-            body_window[act] = (lo, max(hi, max(bwd_users)))
+        last_bwd = max(bwd_users) if bwd_users else first_idx
 
-    for x, (lo, hi) in body_window.items():
-        size = profiler.node_size_bytes.get(x, 0)
-        if size == 0:
-            continue
-        role = profiler.node_type.get(x, NodeType.OTHER)
-        for t in range(lo, min(hi + 1, n)):
-            timeline[role][t] += size
+        for x in body:
+            size = profiler.node_size_bytes.get(x, 0)
+            if size == 0:
+                continue
+            role = profiler.node_type.get(x, NodeType.OTHER)
+            if x is act:
+                # Recomputed activation: alive over redirected-user window.
+                for t in range(first_idx, min(last_bwd + 1, n)):
+                    timeline[role][t] += size
+            else:
+                # Body intermediate: alive briefly during the recomputation
+                # chain — approximate as one spike at the splice point.
+                if 0 <= first_idx < n:
+                    timeline[role][first_idx] += size
 
     return timeline
 
@@ -183,6 +180,17 @@ def simulate_peak(profiler: GraphProfiler, evicted: Iterable[fx.Node]) -> int:
 
 
 def validate_recompute_set(profiler: GraphProfiler, selected_order: List[fx.Node],) -> Tuple[List[fx.Node], List[fx.Node]]:
+    """Iterate to a fixed point: drop any selection whose body isn't safe to
+    replay in backward.  Three conditions for body safety:
+
+      * every body node is a forward call_function / call_method / call_module
+        (so we can re-run it),
+      * every body node sits in the forward region (idx < sep_idx),
+      * **no body node is an in-place / view op** (alias_in_schema): replaying
+        such an op during backward would mutate a retained-boundary tensor and
+        corrupt the original forward state.  (Even idempotent ones like
+        ``relu_`` are excluded for safety; demoting them costs little.)
+    """
     all_acts = {i.node for i in profiler.intermediates}
     selected = set(selected_order)
     changed  = True
@@ -197,6 +205,7 @@ def validate_recompute_set(profiler: GraphProfiler, selected_order: List[fx.Node
             valid = bool(body) and all(
                 n.op in {"call_function", "call_method", "call_module"}
                 and profiler.idx[n] < profiler.sep_idx
+                and not (n.op == "call_function" and alias_in_schema(n))
                 for n in body
             )
             if not valid:
@@ -210,6 +219,25 @@ def validate_recompute_set(profiler: GraphProfiler, selected_order: List[fx.Node
 
 def select_activations(profiler: GraphProfiler,
                        mem_limit: Optional[int] = None) -> SelectionResult:
+    """µ-TWO greedy selection with body-aware cost.
+
+    The candidate's cost is the *full body runtime* needed to recompute it
+    given the current retained set — not just the activation's own runtime.
+    This matches what ``rewrite_with_checkpointing`` actually executes and
+    what ``estimate_recompute_ms`` reports, so the three components agree.
+
+    Per iteration:
+      1. ``simulate_peak`` once to check the current peak.
+      2. If target reached, stop.
+      3. Score every remaining candidate by ``size / body_runtime_ms``,
+         where the body is computed against the current retained set.
+      4. Pick the highest-ratio candidate.
+      5. If after picking the simulated peak didn't drop, roll back and
+         stop — peak isn't activation-dominated.
+
+    Each iteration costs O(|remaining| × N) for the body computations
+    plus O(|evicted| × N) for ``simulate_peak``.  Total O(I² × N).
+    """
     inters = profiler.intermediates
     peak_before = simulate_peak(profiler, evicted=set())
     if not inters:
@@ -219,17 +247,13 @@ def select_activations(profiler: GraphProfiler,
         total_act = sum(i.size_bytes for i in inters)
         mem_limit = peak_before - total_act // 2
 
-    intermediate_set = {i.node for i in inters}
-    state: Dict[fx.Node, Dict] = {}
-    for i in inters:
-        ancestors = {a for a in i.node.all_input_nodes if a in intermediate_set}
-        state[i.node] = {"size": i.size_bytes, "cost":i.recompute_ms, "ancestors": ancestors, "ratio": i.size_bytes / (i.recompute_ms + 1e-9),}
-
+    all_acts        = {i.node for i in inters}
+    inter_by_node   = {i.node: i for i in inters}
     evicted: Set[fx.Node]  = set()
-    order: List[fx.Node] = []
-    remaining = set(intermediate_set)
+    order:   List[fx.Node] = []
+    remaining = set(all_acts)
     prev_peak = peak_before
-    reason = "memory target reached"
+    reason    = "memory target reached"
 
     while remaining:
         peak = simulate_peak(profiler, evicted)
@@ -243,18 +267,29 @@ def select_activations(profiler: GraphProfiler,
             break
         prev_peak = peak
 
-        best = max(remaining, key=lambda n: state[n]["ratio"])
+        # Body-aware scoring against the current retained set.
+        retained = all_acts - evicted
+        best, best_ratio = None, -1.0
+        for n in remaining:
+            body = recompute_body(profiler, n, retained - {n})
+            cost = body_runtime_ms(profiler, body)
+            if cost <= 0:
+                # Fallback to the activation's own runtime so cheap-or-
+                # untimed candidates are still scoreable.
+                cost = inter_by_node[n].recompute_ms
+                if cost <= 0:
+                    continue
+            ratio = inter_by_node[n].size_bytes / cost
+            if ratio > best_ratio:
+                best, best_ratio = n, ratio
+
+        if best is None:
+            reason = "no candidate has a positive recomputation cost"
+            break
+
         evicted.add(best)
         order.append(best)
         remaining.discard(best)
-        best_state = state[best]
-        for n in remaining:
-            cand = state[n]
-            if best in cand["ancestors"]:
-                cand["ancestors"].discard(best)
-                cand["ancestors"].update(best_state["ancestors"])
-                cand["cost"] += best_state["cost"]
-                cand["ratio"] = cand["size"] / (cand["cost"] + 1e-9)
 
     to_recompute, to_retain = validate_recompute_set(profiler, order)
     peak_after = simulate_peak(profiler, to_recompute)
@@ -269,14 +304,15 @@ def first_backward_user(activation: fx.Node,  profiler: GraphProfiler) -> Option
 
 def rewrite_with_checkpointing(gm: fx.GraphModule, profiler: GraphProfiler,
                                to_recompute: List[fx.Node]) -> fx.GraphModule:
-    """Splice shared recomputation chains into the backward pass.
+    """Splice independent recomputation chains into the backward pass.
 
     For each evicted activation, the body of nodes needed to rebuild it is
-    inserted before its first backward use.  Crucially, ``copies`` is a
-    *single global map* across all evictions — if two evictions share an
-    ancestor, that ancestor is materialized exactly once (at the earlier
-    splice point).  Each evicted activation's backward consumers are
-    redirected to the (possibly shared) copy.
+    extracted from the forward pass and a *fresh, independent copy* is
+    inserted before the activation's first backward use.  No sharing
+    across evictions — if two evictions share an ancestor, that ancestor
+    is materialized once per evicted descendant.  This matches the
+    deliverable's "extract subgraph and replicate" description and keeps
+    the cost model (sum of per-eviction body runtimes) consistent.
     """
     if not to_recompute:
         return gm
@@ -285,18 +321,7 @@ def rewrite_with_checkpointing(gm: fx.GraphModule, profiler: GraphProfiler,
     retain_set    = {i.node for i in profiler.intermediates
                      if i.node not in recompute_set}
 
-    # Global map: original FX node -> its single recomputed copy.
-    copies: Dict[fx.Node, fx.Node] = {}
-
-    # Process evictions in order of their first backward use, so the
-    # earliest need for a body node decides its insertion point.  Later
-    # evictions that share that node simply reuse the copy.
-    sorted_evicts = sorted(
-        to_recompute,
-        key=lambda n: (first_bwd_use_idx(n, profiler), profiler.idx[n]),
-    )
-
-    for act in sorted_evicts:
+    for act in sorted(to_recompute, key=lambda n: profiler.idx[n]):
         first_bwd = first_backward_user(act, profiler)
         if first_bwd is None:
             continue
@@ -304,21 +329,20 @@ def rewrite_with_checkpointing(gm: fx.GraphModule, profiler: GraphProfiler,
         if not body:
             continue
 
-        # Insert the body nodes that don't already have a copy, in topo
-        # order, just before this activation's first backward use.
-        # ``arg_transform`` rewires each new copy's inputs through the
-        # global ``copies`` map (boundary nodes fall through to themselves).
+        # Per-activation copies map (independent rewrite — fresh per `act`).
+        # ``arg_transform`` rewires each new copy's inputs through this
+        # map; boundary nodes fall through to the original (which is alive
+        # at backward time because it's a placeholder or retained).
+        copies: Dict[fx.Node, fx.Node] = {}
         with gm.graph.inserting_before(first_bwd):
             for orig in body:
-                if orig in copies:
-                    continue  # shared with an earlier eviction's chain
                 new = gm.graph.node_copy(
                     orig,
                     arg_transform=lambda a: copies.get(a, a),
                 )
                 copies[orig] = new
 
-        # Redirect this act's backward consumers to the (possibly shared) copy.
+        # Redirect this act's backward consumers to its recomputed copy.
         new_act = copies[act]
         for user in list(act.users):
             if user is new_act:
