@@ -56,18 +56,23 @@ def profile_model(name: str, batch_size: int) -> None:
                 profiler.run(*args)
         profiler.aggregate_stats()
 
-        # ---- compute the static-vs-measured peak gap ----
+        # ---- three peak numbers, computed on a fresh measurement run ----
         torch.cuda.reset_peak_memory_stats()
         with torch.no_grad():
             gm(*args)
-        measured  = torch.cuda.max_memory_allocated()
-        estimated = profiler.peak_memory_bytes()
-        gap = (measured - estimated) / max(measured, 1) * 100
+        allocated = torch.cuda.max_memory_allocated()   # peak live tensor bytes
+        reserved  = torch.cuda.max_memory_reserved()    # peak allocator-pool bytes
+        estimated = profiler.peak_memory_bytes()        # our FX-only static walk
+        invisible = allocated - estimated               # tensors we don't see (workspaces)
+        padding   = reserved  - allocated               # allocator block padding
 
         # ---- console: concise summary only ----
         profiler.print_summary()
-        print(f"  Measured peak:     {measured / 1024**2:>7.2f} MB"
-              f"  (gap to estimate: {gap:+.1f} %  =  cuDNN/cuBLAS workspace + allocator)")
+        print(f"  Estimate (FX nodes only):    {estimated / 1024**2:>9.2f} MB")
+        print(f"  Allocated (real tensors):    {allocated / 1024**2:>9.2f} MB"
+              f"   ({invisible / 1024**2:+.1f} MB  =  cuDNN/cuBLAS workspace + sim error)")
+        print(f"  Reserved  (allocator pool):  {reserved  / 1024**2:>9.2f} MB"
+              f"   ({padding   / 1024**2:+.1f} MB  =  caching-allocator block padding)")
         _print_top_tensors(profiler, k=5)
 
         # ---- file: full verbose log ----
